@@ -1,0 +1,26 @@
+name: host
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build with make
+        run: make
+
+      - name: Host tests
+        run: make test
+
+      - name: Build the example
+        run: make example
+
+      - name: Build and test with CMake
+        run: |
+          cmake -S . -B build-cmake -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-cmake --parallel
+          ctest --test-dir build-cmake --output-on-failure
