@@ -1174,6 +1174,7 @@ typedef struct {
 } NextuiOverlayStrings;
 
 typedef struct {
+    void* user;                           /* passed to every callback */
     int (*wifi_get)(void* user);          /* -1 unavailable, 0 off, 1 on */
     int (*wifi_set)(void* user, int on);
     int (*bluetooth_get)(void* user);
@@ -1218,7 +1219,10 @@ Implementation notes for the package:
 
 - `create()` calls `GFX_initAttached(width, height)` after the app has
   initialized SDL video, creates a `UIOverlay` with the app's hooks/strings,
-  and allocates a texture at the same size. `destroy()` calls
+  and allocates a texture at the same size. The config struct is copied, but
+  every string and hint array it points at must outlive the renderer (the same
+  rule as `UIOverlay_create`). The app owns the `SDL_Renderer`; the renderer
+  never destroys it. `destroy()` calls
   `UIOverlay_destroy()`/`GFX_quitAttached()` and frees the texture.
 - For system parity the component must reproduce keymon's resident panel
   setup, not the adapted-app defaults: `hooks.close_first = 1`;
