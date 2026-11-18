@@ -791,12 +791,15 @@ stitch together inconsistent values.
 the corresponding muted override is not `SETTINGS_DEFAULT_MUTE_NO_CHANGE`, i.e.
 the user cannot change that value right now.
 
-The app draws its own rows (Resume, Exit to desktop, Wi-Fi/Bluetooth toggles,
-app-specific actions) in its own style. This contract does not require pixel
-parity with the B5 `UIOverlay`; it requires the same *data* and the same
-ownership rules. The same data feeds a **lean** renderer (framework primitives)
-and a **full-fidelity** port of the B5 panel; the contract does not choose. The visual reference is the "全局浮层界面方案" artifact: centred
-panel, system hardware row top-right, bottom hint bar, dimmed app frame.
+The owner has chosen **full fidelity**: the panel, top-right hardware row,
+bottom hint bar, and HUD must match the system overlay pixel-for-pixel — the
+same `UIOverlay`/`GFX` sources, asset atlas, font, theme, and reference scale.
+The recommended way to get that is the shared optional renderer in §7.10; an
+app that vendors the same NextUI sources and assets is equally conformant. The
+lean data-only route remains possible for apps that do not need full fidelity,
+but it is not the target. The visual reference is the "全局浮层界面方案"
+artifact: centred panel, system hardware row top-right, bottom hint bar,
+dimmed app frame.
 
 ### 7.3 Input ownership
 
@@ -1067,6 +1070,267 @@ guesses.
 
 ---
 
+### 7.10 Full-fidelity rendering component (owner decision)
+
+The owner chose **full fidelity** for the hosted overlay: an in-process panel
+must be visually indistinguishable from keymon's system panel and HUD. This
+section records the design decision and the recommended sharing model. It is
+not an implementation in this repository; the MIT core stays data-only.
+
+#### 7.10.1 Decision
+
+- The app-side panel must reuse the real NextUI drawing code:
+  `UIOverlay_draw()` (panel, rows, header, dim; the footer is optional), the software `GFX`
+  blitters (`GFX_blitAsset`, `GFX_blitPill`, `GFX_blitBattery`,
+  `GFX_blitHardwareGroup`, `GFX_blitHardwareIndicator`), the
+  `RES_PATH/assets@2x.png` atlas, the `RES_PATH` font, and the user's
+  `minuisettings.txt` theme via `CFG_getColor()`.
+- Do **not** reimplement the panel in Apostrophe/borealis primitives and call
+  that full fidelity. A reimplementation is a "lean" renderer and will drift.
+- The recommended sharing model is an **optional, separately packaged,
+  source-level SDL2 renderer component** (`nextui-overlay-render`) that wraps
+  those NextUI modules in a small framework-neutral API. It is not part of the
+  MIT `libnextui_app` core and must not be added to its default build.
+- Apps may instead vendor the same NextUI sources and assets directly. Both
+  routes must pass the same golden-image conformance test (§7.10.4).
+
+**Recommendation: use the shared component, not contract-only vendoring.** A
+single optional renderer package gives one drawing implementation, parity by
+construction, one golden test, and both wiliwili and Moonlight benefit. Vendoring
+the same sources per app is the fallback (no shared package, but the same
+conformance test). The component must stay outside the MIT core because it
+pulls SDL2 and NextUI's rendering code/assets under NextUI's license.
+
+Note that keymon and the app cannot literally share one process or one surface:
+keymon presents its panel through the disp2 layer while the app composites into
+its own `SDL_Renderer`. "Same code" means the same `UIOverlay`/`GFX` sources,
+assets, font, theme, and geometry, with two presentation backends. The shared
+component is the app-side presentation adapter.
+
+The existing `workspace/all/common/apostrophe_overlay_host.c` is the reference
+for the app-side presentation technique: it calls `GFX_initAttached(width,
+height)`, owns a `UIOverlay`, draws it into an offscreen ARGB `SDL_Surface`,
+uploads that to an `SDL_Texture`, and composites it into the app's existing
+`SDL_Renderer`. It never creates a window, renderer, or GFX display and never
+touches the disp2 layer. The shared component generalizes that adapter and
+removes the Apostrophe dependency.
+
+#### 7.10.2 Boundary: what is shared and what is app-owned
+
+| Concern | Core SDK (`libnextui_app`, MIT) | Optional renderer (`nextui-overlay-render`) | App |
+| --- | --- | --- | --- |
+| Protocol, events, sleep/HUD policy, status data | Yes | No | Calls it |
+| SDL2 window/renderer/event loop | No | No | Yes |
+| Panel/HUD drawing, assets, font, theme | No | Yes (NextUI code) | Chooses the route |
+| Input mapping (d-pad/A/B/HOME) | No | Normalized `NextuiOverlayInput` only | Yes (borealis/Apostrophe/SDL) |
+| `EVIOCGRAB` / input ownership | No | No | Yes |
+| Wi-Fi/Bluetooth/exit actions | No | Calls app callbacks | Yes |
+| `overlay.host` / `overlay.state` | Yes | No | Calls it |
+| Golden-image conformance | No | Yes (host test) | Must run it |
+
+The renderer is **not** a second compositor: keymon keeps drawing into the
+disp2 layer with the same `UIOverlay`/`GFX` code; the app renderer composites
+the same drawing into its own SDL renderer. The shared part is the source code
+and the visual model, not a cross-process surface.
+
+#### 7.10.3 Proposed component API
+
+The component is SDL2-based and framework-neutral: no Apostrophe, borealis, or
+NextUI PAD types in its public header. This is a proposal for the package; the
+core SDK does not depend on it.
+
+```c
+typedef struct NextuiOverlayRenderer NextuiOverlayRenderer;
+
+typedef enum {
+    NEXTUI_OVERLAY_INPUT_UP,
+    NEXTUI_OVERLAY_INPUT_DOWN,
+    NEXTUI_OVERLAY_INPUT_ACCEPT,
+    NEXTUI_OVERLAY_INPUT_CANCEL
+} NextuiOverlayInput;
+
+typedef struct {
+    const char* title;             /* default "System" */
+    const char* resume;
+    const char* exit_to_desktop;
+    const char* wifi;
+    const char* bluetooth;
+    const char* on;
+    const char* off;
+    const char* unavailable;
+    const char* not_connected;
+    /* Optional footer labels; defaults match the system panel. */
+    const char* footer_left_button;
+    const char* footer_left_hint;
+    const char* footer_right_button;
+    const char* footer_right_hint;
+} NextuiOverlayStrings;
+
+typedef struct {
+    int (*wifi_get)(void* user);          /* -1 unavailable, 0 off, 1 on */
+    int (*wifi_set)(void* user, int on);
+    int (*bluetooth_get)(void* user);
+    int (*bluetooth_set)(void* user, int on);
+    int (*exit_to_desktop)(void* user);   /* return 1 when accepted */
+} NextuiOverlayActions;
+
+typedef struct {
+    SDL_Renderer* renderer;        /* the app's existing renderer */
+    const char* res_path;          /* NULL: /.system/res */
+    const char* font_path;         /* NULL: <res_path>/font.ttf */
+    int width, height;             /* system reference size, not the app viewport */
+    int close_first;               /* 1 = system resident order (Continue first) */
+    const char* app_name;          /* from hello/session */
+    const NextuiOverlayStrings* strings;   /* NULL: built-in English */
+    const NextuiOverlayActions* actions;   /* NULL: rows unavailable */
+} NextuiOverlayRendererConfig;
+
+NextuiOverlayRenderer* nextui_overlay_renderer_create(
+    const NextuiOverlayRendererConfig* config);
+void nextui_overlay_renderer_destroy(NextuiOverlayRenderer* renderer);
+
+/* Feed the latest status.get/snapshot data before drawing. The renderer uses
+ * it for the shared rows and to keep GFX's battery cache in sync. */
+void nextui_overlay_renderer_set_status(NextuiOverlayRenderer*,
+                                        const NextuiStatus* status);
+
+int  nextui_overlay_renderer_open(NextuiOverlayRenderer*);   /* UIOverlay_open */
+int  nextui_overlay_renderer_close(NextuiOverlayRenderer*);
+int  nextui_overlay_renderer_is_open(const NextuiOverlayRenderer*);
+int  nextui_overlay_renderer_input(NextuiOverlayRenderer*, NextuiOverlayInput);
+
+/* Draw the panel + top-right hardware group. Call after the app frame. */
+void nextui_overlay_renderer_draw(NextuiOverlayRenderer*);
+
+/* Draw a HUD at the system position. The app owns the 1.6 s hide timer. */
+void nextui_overlay_renderer_draw_hud(NextuiOverlayRenderer*,
+                                      const NextuiFeedback* feedback);
+```
+
+Implementation notes for the package:
+
+- `create()` calls `GFX_initAttached(width, height)` after the app has
+  initialized SDL video, creates a `UIOverlay` with the app's hooks/strings,
+  and allocates a texture at the same size. `destroy()` calls
+  `UIOverlay_destroy()`/`GFX_quitAttached()` and frees the texture.
+- For system parity the component must reproduce keymon's resident panel
+  setup, not the adapted-app defaults: `hooks.close_first = 1`;
+  `hooks.capabilities = UI_OVERLAY_CAP_EXIT` plus Wi-Fi/Bluetooth only when
+  the app supplies those actions (no Save/Resume in the first batch);
+  `UIOverlay_setFooterVisible(ui, 0)`; and a `home_footer`-equivalent drawn
+  with `GFX_blitButtonGroup` and the resident key labels. The default strings
+  should match `UIOverlay_defaultStrings()`; pass translated equivalents for
+  other locales.
+- `input()` translates the app's normalized event to `UIOverlay_handleEvent()`
+  and returns `UIOverlayResult` (1/2 consumed/closed). It must not use
+  `UIOverlay_pollInput()`, because that reads NextUI's `PAD` and would tie the
+  component to NextUI's input path. The app owns `EVIOCGRAB`; the renderer
+  never grabs.
+- `draw()` calls `UIOverlay_draw()` on the offscreen surface, then the
+  resident footer. `UIOverlay_draw()` already calls `GFX_blitHardwareGroup()`
+  for the top-right battery/Wi-Fi/Bluetooth/clock group; do not call it a second
+  time. Upload the surface and `SDL_RenderCopy`; never call
+  `SDL_RenderPresent`.
+- `open()`/`draw()` should re-apply the theme from `minuisettings.txt` before
+  painting (the system overlay does this in `SystemOverlay_applyTheme()`), so a
+  theme change while the app is running does not leave a stale panel.
+- The HUD path is the system HUD only: `GFX_blitHardwareIndicator()` at the
+  standard top-right position, no dim, no panel, no grab. The app hides it
+  after 1.6 s.
+- The panel must be laid out at the system's reference resolution
+  (`FIXED_WIDTH`/`FIXED_HEIGHT`, `FIXED_SCALE`) and the resulting texture
+  scaled to the app's viewport. Laying it out at a different resolution
+  changes padding/row geometry and breaks parity.
+- `set_status()` sets the battery cache (`PWR_setBatteryStatus`) so
+  `GFX_blitBatteryAtPosition()` matches the system. Wi-Fi strength and
+  Bluetooth state come from the app's NextUI platform/msettings layer, as in
+  the system overlay; the panel's row text uses the `NextuiStatus` values.
+- The component assumes the app links the NextUI `common` rendering subset
+  (`ui_overlay`, the GFX part of `api.c`, `config`, `palette`, `defines`,
+  `utils`, the SDL compatibility layer, and the platform library). That
+  dependency is the price of exact reuse; it is why the component is not in
+  the MIT core.
+- One renderer instance per process. `GFX`/`CFG` are process-global; do not
+  initialize GFX a second time or use `GFX_flip`/`PLAT_*` video calls.
+
+#### 7.10.4 Visual conformance and the golden test
+
+Full fidelity is a testable property, not a style claim. The component (and
+any app that vendors the sources) MUST pass a host golden-image test:
+
+1. Render keymon's system path (`SystemOverlay_showHome`/`UIOverlay_draw` +
+   `GFX_blitHardwareGroup`, and the HUD path) into a malloc-backed ARGB surface
+   at the reference size, using the same `minuisettings.txt`, assets, and font.
+   `workspace/all/common/tests/system_overlay_test.c` is the existing pattern.
+2. Render the app renderer with the same model: app name, selected row,
+   Wi-Fi/Bluetooth states, battery/charging, volume, theme.
+3. Assert zero differing pixels for the dim wash, panel (header, rows, icons,
+   text, selection), top-right hardware group (drawn by `UIOverlay_draw`), the
+   resident footer/hint bar, and the HUD; separately assert the HUD's 1.6 s
+   lifecycle is app-driven.
+4. Run the test for at least the default theme and one custom theme.
+
+A pixel mismatch is a failure. "Looks close" is not full fidelity. The test is
+host-only; real disp2 composition and the app's SDL backend still need device
+verification (phase C/D).
+
+#### 7.10.5 Versioning and pinning
+
+- The component must be built from the **same NextUI commit** as the system
+  overlay it is meant to match. Pin it as a submodule (or a vendored snapshot)
+  and record `NEXTUI_OVERLAY_RENDERER_VERSION` plus the NextUI commit in the
+  build.
+- A panel drawn by a different NextUI commit is not conformant even if the API
+  is unchanged; the assets, font, theme colours, or geometry may have moved.
+- Protocol 1 does not negotiate rendering. If a future system wants to expose
+  a diagnostic, an optional `hello.ui` object (renderer name, version, scale,
+  reference width/height) may be added; clients compare it and log a mismatch,
+  never fail the handshake. This is not required for protocol 1 and is not
+  part of the core SDK API today.
+
+#### 7.10.6 Licensing (hard constraint, owner decision)
+
+NextUI is licensed under **PolyForm Noncommercial License 1.0.0**
+(`4fuu/NextUI/LICENSE`), not MIT or GPL. This SDK is MIT. Consequences:
+
+- The MIT core MUST NOT bundle NextUI's `ui_overlay`, `GFX`, assets, font, or
+  other NextUI code. Doing so would relicense the core and conflict with its
+  MIT distribution.
+- A shared renderer that reuses those sources must be a **separate package**
+  under NextUI's license (or another license the owner chooses), consumed by
+  apps that already ship in the NextUI ecosystem. It cannot be merged into
+  `libnextui_app` as MIT code.
+- GPLv3 apps (wiliwili) linking a PolyForm-NC renderer raise a GPL
+  compatibility question. The owner must confirm the distribution posture;
+  this contract cannot decide it.
+- If a purely MIT renderer is required, it must be a clean-room
+  reimplementation with recreated assets; pixel parity with the original
+  assets is then not guaranteed. That is a different project, not a refactor
+  of the shared component.
+
+Recommended packaging: a separate repository
+`nextui-overlay-render` (or a clearly separated `render/` subtree with its own
+LICENSE and opt-in build) that pins NextUI as a submodule and produces a static
+library. The core `nextui-app-sdk` stays MIT/libc-only; wiliwili and Moonlight
+add the renderer as a submodule/dependency in their paks. If the owner prefers
+one repository, the renderer subtree must not be built by default and must
+carry its own license file.
+
+#### 7.10.7 Why not contract-only, and why not in the core
+
+| Option | Result |
+| --- | --- |
+| Contract data + visual spec, every app vendors | No license mixing, but two copies of the panel/GFX/asset code and guaranteed drift; fixes twice. Acceptable only as a fallback. |
+| Shared component in the MIT core | Rejected: SDL2 + NextUI code/assets + PolyForm NC relicense the core and break its "libc-only, MIT" promise. |
+| Shared optional component, separate package (recommended) | One drawing implementation, pixel parity by construction, one golden test, both wiliwili and Moonlight benefit; cost is the NextUI/SDL dependency and the license boundary. |
+| Clean-room MIT renderer | Only if MIT distribution is mandatory; cannot guarantee pixel parity with NextUI's assets. |
+
+The component stays framework-neutral at its API (SDL2 + normalized input +
+`NextuiStatus`/`NextuiFeedback`); the UI framework binding is a thin layer in
+each app.
+
+---
+
 ## 8. Status and battery
 
 ### 8.1 `status.get`
@@ -1301,6 +1565,10 @@ An adapted app, on a device with all features:
 10. On `status.changed`: update rows.
 11. On `session.ended`: stop; the process is about to be torn down by the
     launch parent anyway.
+
+Rendering is out of band: a full-fidelity app uses the shared renderer
+(§7.10) or vendors the same NextUI sources, pinned to the system's NextUI
+commit. Protocol 1 does not negotiate rendering.
 
 An unadapted app, or an app that never connects:
 
@@ -1550,7 +1818,9 @@ assert:
 - `status.changed` coalescing and the 30 s snapshot;
 - unadapted `handled_by_system` unchanged;
 - the desktop/build with no status backend reports `available:false`, never a
-  fake value.
+  fake value;
+- the full-fidelity renderer passes the golden-image test (§7.10.4) against
+  keymon's system path for the panel, hardware group, and HUD.
 
 ---
 
@@ -1627,6 +1897,12 @@ documented degradation in §7.9.5 applies. The unknowns below are separate:
 8. **`battery.read` / `power.info`.** They remain registered but
    unimplemented. `battery.status` is the canonical read; do not silently make
    the old names return different shapes.
+9. **Renderer packaging and licensing.** The technical route is decided
+   (§7.10: shared optional SDL2 renderer, separate package, same NextUI
+   commit). The owner must decide the distribution/license posture: separate
+   PolyForm-NC package, per-app vendoring, or a clean-room MIT renderer. This
+   is the only blocker to publishing the renderer as a reusable package; it
+   does not block phase B or the protocol.
 
 ---
 
@@ -1686,7 +1962,12 @@ A system implementation is protocol 1 conformant when:
   `status.snapshot`/`status.changed`, `overlay.home`, `overlay.state`, HUD
   policy/feedback), dynamic overlay ownership (`overlay.host`, `not_hosting`,
   effective vs declared host), `battery.status`, `hello`, versioning/features/
-  limits, and the expanded error model. Replaces the v0 draft. `status.subscribe` from the
+  limits, and the expanded error model.
+- **v1 addendum (full-fidelity rendering)** — owner decision recorded in
+  §7.10: reuse `UIOverlay`/`GFX`/assets/font/theme, recommended as a separate
+  optional SDL2 renderer package with a golden-image test; the MIT core stays
+  data-only. NextUI's PolyForm-NC license makes this a separate package or a
+  per-app vendor decision, not core code. No wire-protocol change. Replaces the v0 draft. `status.subscribe` from the
   draft is **not** a separate operation: one `subscribe` op opens the single
   event stream and carries the `status` family plus sleep/HUD/overlay events.
 - **v0 draft** — placeholder scope and open questions.
