@@ -17,7 +17,7 @@ phases.
 
 | Feature | What the app can do |
 | --- | --- |
-| **HOME overlay hosting** | Declare the existing top-level `"capabilities": ["overlay"]` in `pak.json`, own HOME in-process, draw the shared battery/Wi-Fi/Bluetooth/volume rows plus its own rows. The system yields HOME, draws nothing, grabs nothing (`handled_by_app`). The app can yield and restore this dynamically with `overlay.host` (e.g. Moonlight: menu hosts, streaming yields to the system panel). |
+| **HOME overlay hosting** | Declare the existing top-level `"capabilities": ["overlay"]` in `pak.json`, own HOME in-process, draw the shared battery/Wi-Fi/Bluetooth/volume rows plus its own rows. The system yields HOME, draws nothing, grabs nothing (`handled_by_app`). The app can yield and restore this dynamically with `overlay.host` (e.g. Moonlight: menu hosts, streaming yields to the system panel). Full fidelity is the chosen rendering route; see below. |
 | **HUD cooperation** | Choose, per kind and at runtime, whether the app or the system draws the volume/brightness/colour-temperature/mute HUD (`hud.policy`). The app receives the new value as a `feedback` event. |
 | **Sleep/wake handshake** | Receive `sleep.prepare` before suspend, pause/save and `sleep.ack`, or defer with `sleep.inhibit` (reason + timeout). Receive `wake.done` after resume. |
 | **Battery/status** | `battery.status` on demand, `status.get` for all overlay rows, and push updates over one event stream. |
@@ -256,13 +256,18 @@ Apostrophe/SDL process, but `stream_flow()` calls `ap_quit()` before spawning
 - **streaming → menu**: rebuild SDL/UI → `overlay_set_host(app, 1)` → host the
   panel again.
 
-The SDK only supplies **data** (`NextuiStatus` rows, `overlay.home`, `feedback`,
-`sleep.prepare`/`wake.done`); it never draws. Both rendering routes are
-therefore supported without contract changes:
+The core SDK only supplies **data** (`NextuiStatus` rows, `overlay.home`,
+`feedback`, `sleep.prepare`/`wake.done`); it never draws. The owner chose
+**full fidelity**, so the target is NextUI's real `UIOverlay` + software `GFX` +
+asset atlas + font + `CFG` theme, not an Apostrophe reimplementation.
 
-- **lean** — Apostrophe's own status bar / `ap_draw_*` primitives;
-- **full fidelity** — vendor NextUI's `UIOverlay`/software `GFX` and feed it the
-  same rows.
+The recommended sharing model is an **optional, separately packaged SDL2
+renderer** (`nextui-overlay-render`) that wraps those NextUI sources behind a
+small framework-neutral API. It is not part of this MIT, libc-only repository;
+the app provides its `SDL_Renderer`, input mapping, and `EVIOCGRAB`, and the
+renderer only draws the panel/HUD and handles normalized up/down/accept/cancel
+events. The design, API sketch, golden-image test, and licensing constraint are
+in [contract §7.10](docs/CONTRACT.md#710-full-fidelity-rendering-component-owner-decision).
 
 An app that cannot draw must yield the host rather than keep a dead HOME key.
 If the server predates `overlay.host`, use the documented fallback: HOME ends
@@ -271,6 +276,35 @@ the stream and returns to the menu.
 While integrating, disable the app's own power/suspend path (Apostrophe:
 `ap_set_power_handler(false)`) so `sleep.prepare`/`wake.done` is the only sleep
 path, and use `sleep.inhibit` instead of `/tmp/stay_awake`-style flags.
+
+### Full-fidelity renderer (optional, separate package)
+
+The owner decision is recorded in contract §7.10. Summary:
+
+- **Reuse, don't reimplement**: `UIOverlay_draw()`, the `GFX` blitters, the
+  `assets@2x.png` atlas, the system font, and `CFG_getColor()` theme values.
+  Render at the system reference size and scale the final texture to the app's
+  viewport.
+- **Proposed API**: create with the app's `SDL_Renderer` + reference size;
+  `set_status(NextuiStatus)`; `open/close/is_open`; `input(UP|DOWN|ACCEPT|
+  CANCEL)` (mapped by the app, not NextUI PAD); `draw()` (panel + hardware
+  group, no `SDL_RenderPresent`); `draw_hud(NextuiFeedback)` (app owns the
+  1.6 s hide timer). The app owns the Wi-Fi/Bluetooth/exit action callbacks.
+- **Golden test**: render keymon's system path and the app renderer with the
+  same model/theme/assets and assert zero differing pixels for the panel,
+  hardware group, and HUD. The existing
+  `workspace/all/common/tests/system_overlay_test.c` is the pattern.
+- **Pinning**: build the renderer from the same NextUI commit as the system
+  overlay it must match.
+- **Licensing**: NextUI is PolyForm Noncommercial 1.0.0, not MIT/GPL. The MIT
+  core cannot bundle its rendering code/assets. The renderer must be a separate
+  package under NextUI's license (or per-app vendoring); the owner must confirm
+  the distribution posture, especially for GPLv3 wiliwili. A clean-room MIT
+  renderer is a different project and cannot guarantee pixel parity with the
+  original assets.
+
+`libnextui_app` remains data-only, MIT, and libc/POSIX; it has no SDL2 or
+NextUI rendering dependency.
 
 ### Compatibility
 
@@ -317,6 +351,14 @@ tests/                   JSON + real-socket client tests, fake devserv
 .github/workflows/ci.yml make + CMake/CTest on Ubuntu
 ```
 
+## Rendering status
+
+The full-fidelity renderer is a **design decision and API proposal**, not an
+implementation in this PR. The core library is complete and tested; the
+renderer package (or per-app vendoring) is phase C/D work, gated on the owner's
+licensing choice. The golden-image test in contract §7.10.4 is its acceptance
+gate.
+
 ## Phase B (system side) — what is required
 
 The contract is implementable, but it is not yet implemented in NextUI. Phase B
@@ -341,5 +383,10 @@ points and open decisions is in [docs/CONTRACT.md §13 and §16](docs/CONTRACT.m
 
 ## License
 
-MIT. See [LICENSE](LICENSE). Apps under any license (GPLv3 wiliwili, GPL
-Moonlight, …) can link it; NextUI itself keeps its own license.
+The core SDK is MIT. See [LICENSE](LICENSE). Apps under any license (GPLv3
+wiliwili, GPL Moonlight, …) can link it.
+
+NextUI itself and the proposed full-fidelity renderer reuse NextUI code and
+assets under **PolyForm Noncommercial 1.0.0**; they are not part of the MIT
+core. The renderer must be distributed separately (or vendored by the app)
+under NextUI's terms. See contract §7.10.6.
