@@ -1150,6 +1150,11 @@ typedef enum {
 } NextuiOverlayInput;
 
 typedef struct {
+    const char* button;            /* e.g. "U/D", "A", "B", "Home" */
+    const char* hint;              /* e.g. "Select", "OPEN", "Close" */
+} NextuiOverlayHint;
+
+typedef struct {
     const char* title;             /* default "System" */
     const char* resume;
     const char* exit_to_desktop;
@@ -1159,11 +1164,13 @@ typedef struct {
     const char* off;
     const char* unavailable;
     const char* not_connected;
-    /* Optional footer labels; defaults match the system panel. */
-    const char* footer_left_button;
-    const char* footer_left_hint;
-    const char* footer_right_button;
-    const char* footer_right_hint;
+    /* Resident system footer: two GFX_blitButtonGroup() calls, exactly like
+     * keymon's home_footer(). Defaults: left U/D Select + A OPEN,
+     * right B Close + Home Close. */
+    const NextuiOverlayHint* left_hints;
+    int left_hint_count;
+    const NextuiOverlayHint* right_hints;
+    int right_hint_count;
 } NextuiOverlayStrings;
 
 typedef struct {
@@ -1218,9 +1225,11 @@ Implementation notes for the package:
   `hooks.capabilities = UI_OVERLAY_CAP_EXIT` plus Wi-Fi/Bluetooth only when
   the app supplies those actions (no Save/Resume in the first batch);
   `UIOverlay_setFooterVisible(ui, 0)`; and a `home_footer`-equivalent drawn
-  with `GFX_blitButtonGroup` and the resident key labels. The default strings
-  should match `UIOverlay_defaultStrings()`; pass translated equivalents for
-  other locales.
+  with two `GFX_blitButtonGroup()` calls and the resident key labels. The
+  default hint model is `{U/D, Select}, {A, OPEN}` on the left and
+  `{B, Close}, {Home, Close}` on the right; pass translated equivalents for
+  other locales. The panel text strings should match
+  `UIOverlay_defaultStrings()` / `I18N_overlayStrings()`.
 - `input()` translates the app's normalized event to `UIOverlay_handleEvent()`
   and returns `UIOverlayResult` (1/2 consumed/closed). It must not use
   `UIOverlay_pollInput()`, because that reads NextUI's `PAD` and would tie the
