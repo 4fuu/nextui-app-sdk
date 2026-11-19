@@ -162,14 +162,44 @@ Blocking and poll-friendly models are both supported:
 ### Thread safety
 
 - Request functions (`battery_get`, `status_get`, `sleep_*`, `hud_*`,
-  `overlay_*`, `call`) are serialized by an internal recursive mutex and may be
-  called from any thread.
+  `overlay_*`, `call`) are serialized by an internal request mutex and may be
+  called from any thread. The event pump never takes that mutex.
 - `poll` / `wait` / `next_event` must be used by exactly one thread at a time
-  and not concurrently with each other. Callbacks run on that thread; they may
-  call request functions, but not poll/wait/next_event recursively.
-- `destroy` must not race with other calls.
+  and not concurrently with each other. They may run concurrently with
+  requests on other threads; a request blocked in devserv cannot stop the
+  subscribe socket from draining.
+- Callbacks run on the thread that calls `poll` / `wait` / `next_event`; they
+  may call request functions, but not `poll` / `wait` / `next_event`
+  recursively. A blocking request made inside a callback stalls event delivery
+  for its duration; use another thread for long work.
+- `connect` / `disconnect` must not race with a poll thread. `destroy` must
+  not race with other calls.
 - The sleep handler consumes `sleep.prepare`; with no handler the library acks
   immediately (`paused:0`) and delivers the event for observation.
+
+#### Internal locking
+
+The client separates three concerns so request I/O and event delivery cannot
+form a cycle:
+
+| Lock | Protects | Held across I/O? |
+| --- | --- | --- |
+| `request_lock` | Request-channel round trips, including `hello`/`subscribe` | Yes |
+| `state_lock` | `NextuiAppInfo`, `last_error`, `host_override`, connected/handshaking flags | No |
+| `event_lock` | Event queue, cached status, worker error queue | No |
+
+Lock order is `request_lock -> state_lock`; `event_lock` is independent. The
+pump takes only `state_lock`/`event_lock`, briefly, and never across
+`poll()`, `recv()`, or a callback. That is the fix for a deadlock where a
+request held the only mutex while waiting for devserv, the pump could not drain
+a full subscribe socket, and devserv blocked writing that socket.
+
+Replies the pump has to send (`sleep.ack`, `sleep.inhibit`, and the overlay
+host restore after an automatic reconnect) are queued and executed by an
+internal worker thread. The pump keeps draining while the worker waits on the
+request connection. Worker failures surface as
+`NEXTUI_APP_EVENT_TRANSPORT_ERROR` on the poll thread, so callbacks still have
+the documented thread affinity.
 
 ### Errors
 
@@ -333,12 +363,18 @@ NextUI rendering dependency.
   desktop battery; `call`; session end; callback vs queue; overflow; automatic
   reconnect (including re-applying `overlay_set_host`); dynamic host
   yield/restore and `not_hosting`; stale session; `overlay.home`;
-  `sleep.status` detail.
+  `sleep.status` detail; and concurrency regressions: a request in flight while
+  events (including `sleep.prepare`) arrive, `session.ended` and `overflow`
+  during a request, and a full subscribe buffer with a concurrent request. The
+  concurrency cases run under a 15 s deadlock watchdog.
 
 The fixture is scripted through `test.*` control operations and logs every
 request, so the tests assert the actual wire messages (for example
 `{"op":"sleep.ack",...,"paused":true}`), not mock calls. See
 `tests/fake_devserv.c`.
+
+`make test-asan` runs the same suite with AddressSanitizer and
+UndefinedBehaviorSanitizer; CI runs it in a separate job.
 
 ## Repository layout
 

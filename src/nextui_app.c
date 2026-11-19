@@ -17,10 +17,68 @@
 #define NX_QUEUE_CAPACITY 32
 #define NX_RECONNECT_DELAY_MS 1000
 #define NX_LINE_BUFFER (NEXTUI_APP_LINE_MAX * 2)
+#define NX_DEFERRED_CAPACITY 16
+#define NX_ASYNC_ERROR_CAPACITY 8
+#define NX_DEFERRED_WAKE_MS 100
+
+/*
+ * Work the event pump must do on the request channel (sleep ack/inhibit and
+ * overlay host restore after a reconnect). It runs on the worker thread, never
+ * on the pump thread: a synchronous request can block on devserv, and blocking
+ * the pump there is what let a full event socket deadlock the client.
+ */
+typedef enum
+{
+    NX_DEFERRED_SLEEP_ACK = 0,
+    NX_DEFERRED_SLEEP_INHIBIT,
+    NX_DEFERRED_HOST_OVERRIDE
+} NxDeferredKind;
+
+typedef struct
+{
+    NxDeferredKind kind;
+    char session_id[NEXTUI_APP_SESSION_ID_SIZE];
+    char sleep_id[NEXTUI_APP_SLEEP_ID_SIZE];
+    char reason[NEXTUI_APP_REASON_SIZE];
+    char detail[NEXTUI_APP_DETAIL_SIZE];
+    int paused;
+    int saved;
+    int timeout_ms;
+    int host;
+} NxDeferred;
 
 struct NextuiApp
 {
-    pthread_mutex_t lock;
+    /*
+     * Lock design (see README "Internal locking"):
+     *
+     *   request_lock  serializes request-channel round trips, including the
+     *                 hello/subscribe handshake. Held across socket I/O.
+     *   state_lock    guards info, connected, handshaking, last_error,
+     *                 last_detail and host_override. Only held briefly; never
+     *                 across I/O, callbacks, poll() or recv().
+     *   event_lock    guards the event queue, the cached status snapshot and
+     *                 worker error events. Only held briefly; never across
+     *                 I/O or callbacks.
+     *
+     * Ordering: request_lock -> state_lock. event_lock is independent.
+     * The event pump takes state_lock and event_lock briefly and never takes
+     * request_lock, so draining the subscribe socket cannot depend on an
+     * in-flight request.
+     */
+    pthread_mutex_t request_lock;
+    pthread_mutex_t state_lock;
+    pthread_mutex_t event_lock;
+
+    /* Deferred request-channel work, executed on the worker thread. */
+    pthread_mutex_t deferred_lock;
+    pthread_cond_t deferred_cond;
+    pthread_t worker;
+    int worker_started;
+    int worker_stop;
+    NxDeferred deferred[NX_DEFERRED_CAPACITY];
+    int deferred_head;
+    int deferred_count;
 
     char socket_path[NEXTUI_APP_SOCKET_SIZE];
     char pak[NEXTUI_APP_PAK_SIZE];
@@ -41,7 +99,7 @@ struct NextuiApp
     unsigned event_features;
     int heartbeat_ms;
 
-    NextuiAppInfo info; /* guarded by lock; updated by connect/reconnect */
+    NextuiAppInfo info; /* guarded by state_lock; updated by connect/reconnect */
     char last_error[NEXTUI_APP_REASON_SIZE];
     char last_detail[NEXTUI_APP_DETAIL_SIZE];
 
@@ -51,12 +109,15 @@ struct NextuiApp
     char inbuf[NX_LINE_BUFFER];
     size_t inlen;
     unsigned long long last_event_at;
-    NextuiStatus status;
+    NextuiStatus status; /* guarded by event_lock */
     int have_status;
 
     /* Event delivery. */
     NextuiAppEvent queue[NX_QUEUE_CAPACITY];
-    int queue_count;
+    int queue_count; /* guarded by event_lock */
+    NextuiAppEvent async_errors[NX_ASYNC_ERROR_CAPACITY];
+    int async_error_head;
+    int async_error_count;
     NextuiAppEventCallback event_callback;
     void* event_user;
     NextuiAppSleepHandler sleep_handler;
@@ -77,10 +138,18 @@ static void copy_string(char* dst, size_t size, const char* src)
 static void set_last_error(NextuiApp* app, const char* code, const char* detail)
 {
     if (app == NULL) return;
-    pthread_mutex_lock(&app->lock);
+    pthread_mutex_lock(&app->state_lock);
     copy_string(app->last_error, sizeof app->last_error, code != NULL ? code : "");
     copy_string(app->last_detail, sizeof app->last_detail, detail != NULL ? detail : "");
-    pthread_mutex_unlock(&app->lock);
+    pthread_mutex_unlock(&app->state_lock);
+}
+
+/* Copy the session-facing state without holding state_lock across I/O. */
+static void app_info_copy(NextuiApp* app, NextuiAppInfo* out)
+{
+    pthread_mutex_lock(&app->state_lock);
+    *out = app->info;
+    pthread_mutex_unlock(&app->state_lock);
 }
 
 static void log_message(NextuiApp* app, int level, const char* message)
@@ -339,6 +408,7 @@ static NextuiAppHudKind parse_hud_kind(const char* name)
 
 static void queue_push(NextuiApp* app, const NextuiAppEvent* event)
 {
+    pthread_mutex_lock(&app->event_lock);
     if (app->queue_count >= NX_QUEUE_CAPACITY)
     {
         int index;
@@ -364,12 +434,16 @@ static void queue_push(NextuiApp* app, const NextuiAppEvent* event)
         }
     }
     app->queue[app->queue_count++] = *event;
+    pthread_mutex_unlock(&app->event_lock);
 }
 
 static int deliver(NextuiApp* app, const NextuiAppEvent* event)
 {
     if (app->event_callback != NULL)
     {
+        /* Callbacks run on the pump thread and may issue requests. No lock is
+         * held here: request_lock is only for request I/O, and event_lock is
+         * only for the queue. */
         app->event_callback(app, event, app->event_user);
     }
     else
@@ -377,6 +451,107 @@ static int deliver(NextuiApp* app, const NextuiAppEvent* event)
         queue_push(app, event);
     }
     return 1;
+}
+
+/* Worker-side transport errors are queued for the pump thread, so callbacks
+ * still run on the thread that owns poll/wait. */
+static void queue_async_error(NextuiApp* app, const NxDeferred* action)
+{
+    NextuiAppEvent event;
+    char code[NEXTUI_APP_REASON_SIZE];
+    char detail[NEXTUI_APP_DETAIL_SIZE];
+
+    pthread_mutex_lock(&app->state_lock);
+    copy_string(code, sizeof code, app->last_error);
+    copy_string(detail, sizeof detail, app->last_detail);
+    pthread_mutex_unlock(&app->state_lock);
+
+    memset(&event, 0, sizeof event);
+    event.type = NEXTUI_APP_EVENT_TRANSPORT_ERROR;
+    event.at_ms = nx_now_ms();
+    copy_string(event.session_id, sizeof event.session_id, action->session_id);
+    copy_string(event.data.error.code, sizeof event.data.error.code,
+                code[0] != '\0' ? code : "transport");
+    copy_string(event.data.error.detail, sizeof event.data.error.detail,
+                detail[0] != '\0' ? detail : "deferred request failed");
+
+    pthread_mutex_lock(&app->event_lock);
+    if (app->async_error_count >= NX_ASYNC_ERROR_CAPACITY)
+    {
+        app->async_error_head = (app->async_error_head + 1) % NX_ASYNC_ERROR_CAPACITY;
+        app->async_error_count--;
+    }
+    app->async_errors[(app->async_error_head + app->async_error_count) % NX_ASYNC_ERROR_CAPACITY] =
+        event;
+    app->async_error_count++;
+    pthread_mutex_unlock(&app->event_lock);
+}
+
+static int drain_async_errors(NextuiApp* app)
+{
+    NextuiAppEvent events[NX_ASYNC_ERROR_CAPACITY];
+    int count = 0;
+    int index;
+    int produced = 0;
+
+    pthread_mutex_lock(&app->event_lock);
+    while (app->async_error_count > 0 && count < NX_ASYNC_ERROR_CAPACITY)
+    {
+        events[count++] = app->async_errors[app->async_error_head];
+        app->async_error_head = (app->async_error_head + 1) % NX_ASYNC_ERROR_CAPACITY;
+        app->async_error_count--;
+    }
+    pthread_mutex_unlock(&app->event_lock);
+
+    for (index = 0; index < count; index++)
+    {
+        (void)deliver(app, &events[index]);
+        produced++;
+    }
+    return produced;
+}
+
+static int deferred_pending(NextuiApp* app)
+{
+    int pending;
+
+    pthread_mutex_lock(&app->deferred_lock);
+    pending = app->deferred_count > 0;
+    pthread_mutex_unlock(&app->deferred_lock);
+    if (!pending)
+    {
+        pthread_mutex_lock(&app->event_lock);
+        pending = app->async_error_count > 0;
+        pthread_mutex_unlock(&app->event_lock);
+    }
+    return pending;
+}
+
+static void queue_deferred(NextuiApp* app, const NxDeferred* action)
+{
+    pthread_mutex_lock(&app->deferred_lock);
+    if (app->deferred_count >= NX_DEFERRED_CAPACITY)
+    {
+        app->deferred_head = (app->deferred_head + 1) % NX_DEFERRED_CAPACITY;
+        app->deferred_count--;
+    }
+    app->deferred[(app->deferred_head + app->deferred_count) % NX_DEFERRED_CAPACITY] = *action;
+    app->deferred_count++;
+    pthread_cond_signal(&app->deferred_cond);
+    pthread_mutex_unlock(&app->deferred_lock);
+}
+
+static void clear_deferred(NextuiApp* app)
+{
+    pthread_mutex_lock(&app->deferred_lock);
+    app->deferred_head = 0;
+    app->deferred_count = 0;
+    pthread_mutex_unlock(&app->deferred_lock);
+
+    pthread_mutex_lock(&app->event_lock);
+    app->async_error_head = 0;
+    app->async_error_count = 0;
+    pthread_mutex_unlock(&app->event_lock);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -409,12 +584,16 @@ static NextuiAppStatus request_raw(NextuiApp* app, const char* request_line, cha
 {
     int descriptor;
     int status;
+    int available;
     char line[NEXTUI_APP_LINE_MAX];
     size_t length;
 
     if (app == NULL || request_line == NULL || response == NULL || response_size < 2)
         return NEXTUI_APP_ERR_INVALID_ARGUMENT;
-    if (!app->connected && !app->handshaking) return NEXTUI_APP_ERR_NOT_CONNECTED;
+    pthread_mutex_lock(&app->state_lock);
+    available = app->connected || app->handshaking;
+    pthread_mutex_unlock(&app->state_lock);
+    if (!available) return NEXTUI_APP_ERR_NOT_CONNECTED;
     if (strlen(request_line) + 2 > sizeof line)
     {
         set_last_error(app, "bad_request", "request line is too long");
@@ -486,9 +665,9 @@ NextuiAppStatus nextui_app_request(NextuiApp* app, const char* request_line, cha
     NextuiAppStatus status;
 
     if (app == NULL) return NEXTUI_APP_ERR_INVALID_ARGUMENT;
-    pthread_mutex_lock(&app->lock);
+    pthread_mutex_lock(&app->request_lock);
     status = request_raw(app, request_line, response, response_size);
-    pthread_mutex_unlock(&app->lock);
+    pthread_mutex_unlock(&app->request_lock);
     return status;
 }
 
@@ -520,26 +699,29 @@ const char* nextui_app_status_string(NextuiAppStatus status)
     return "unknown";
 }
 
+/* Deferred request-channel actions run here; see struct NextuiApp. */
+static void* worker_main(void* argument);
+static void execute_deferred(NextuiApp* app, const NxDeferred* action);
+
 NextuiApp* nextui_app_create(const NextuiAppConfig* config)
 {
     NextuiApp* app = (NextuiApp*)calloc(1, sizeof(NextuiApp));
     const char* environment;
-    pthread_mutexattr_t attributes;
+    int initialized = 0;
 
     if (app == NULL) return NULL;
-    if (pthread_mutexattr_init(&attributes) != 0)
-    {
-        free(app);
-        return NULL;
-    }
-    if (pthread_mutexattr_settype(&attributes, PTHREAD_MUTEX_RECURSIVE) != 0
-        || pthread_mutex_init(&app->lock, &attributes) != 0)
-    {
-        pthread_mutexattr_destroy(&attributes);
-        free(app);
-        return NULL;
-    }
-    pthread_mutexattr_destroy(&attributes);
+    if (pthread_mutex_init(&app->request_lock, NULL) != 0) goto fail;
+    initialized = 1;
+    if (pthread_mutex_init(&app->state_lock, NULL) != 0) goto fail;
+    initialized = 2;
+    if (pthread_mutex_init(&app->event_lock, NULL) != 0) goto fail;
+    initialized = 3;
+    if (pthread_mutex_init(&app->deferred_lock, NULL) != 0) goto fail;
+    initialized = 4;
+    if (pthread_cond_init(&app->deferred_cond, NULL) != 0) goto fail;
+    initialized = 5;
+    if (pthread_create(&app->worker, NULL, worker_main, app) != 0) goto fail;
+    app->worker_started = 1;
 
     app->event_fd = -1;
     app->host_override = -1;
@@ -588,6 +770,15 @@ NextuiApp* nextui_app_create(const NextuiAppConfig* config)
                     "nextui-app-sdk/" NEXTUI_APP_SDK_VERSION_STRING);
 
     return app;
+
+fail:
+    if (initialized >= 5) pthread_cond_destroy(&app->deferred_cond);
+    if (initialized >= 4) pthread_mutex_destroy(&app->deferred_lock);
+    if (initialized >= 3) pthread_mutex_destroy(&app->event_lock);
+    if (initialized >= 2) pthread_mutex_destroy(&app->state_lock);
+    if (initialized >= 1) pthread_mutex_destroy(&app->request_lock);
+    free(app);
+    return NULL;
 }
 
 static void close_event_stream(NextuiApp* app, int emit_error, const char* detail)
@@ -602,11 +793,13 @@ static void close_event_stream(NextuiApp* app, int emit_error, const char* detai
 
     if (emit_error && !app->stopped)
     {
+        NextuiAppInfo info;
         NextuiAppEvent event;
         memset(&event, 0, sizeof event);
         event.type = NEXTUI_APP_EVENT_TRANSPORT_ERROR;
         event.at_ms = nx_now_ms();
-        copy_string(event.session_id, sizeof event.session_id, app->info.session_id);
+        app_info_copy(app, &info);
+        copy_string(event.session_id, sizeof event.session_id, info.session_id);
         copy_string(event.data.error.code, sizeof event.data.error.code, "transport");
         copy_string(event.data.error.detail, sizeof event.data.error.detail,
                     detail != NULL ? detail : "event stream closed");
@@ -618,16 +811,36 @@ void nextui_app_disconnect(NextuiApp* app)
 {
     if (app == NULL) return;
     close_event_stream(app, 0, NULL);
-    pthread_mutex_lock(&app->lock);
+    clear_deferred(app);
+    pthread_mutex_lock(&app->state_lock);
     app->connected = 0;
-    pthread_mutex_unlock(&app->lock);
+    pthread_mutex_unlock(&app->state_lock);
 }
 
 void nextui_app_destroy(NextuiApp* app)
 {
     if (app == NULL) return;
+    if (app->worker_started)
+    {
+        pthread_mutex_lock(&app->deferred_lock);
+        app->worker_stop = 1;
+        pthread_cond_signal(&app->deferred_cond);
+        pthread_mutex_unlock(&app->deferred_lock);
+    }
+    /* Close the subscribe socket before joining: if devserv is blocked writing
+     * a full event socket, closing it lets a worker request finish instead of
+     * waiting for the worker's I/O timeout. */
     close_event_stream(app, 0, NULL);
-    pthread_mutex_destroy(&app->lock);
+    if (app->worker_started)
+    {
+        pthread_join(app->worker, NULL);
+        app->worker_started = 0;
+    }
+    pthread_cond_destroy(&app->deferred_cond);
+    pthread_mutex_destroy(&app->deferred_lock);
+    pthread_mutex_destroy(&app->event_lock);
+    pthread_mutex_destroy(&app->state_lock);
+    pthread_mutex_destroy(&app->request_lock);
     free(app);
 }
 
@@ -637,9 +850,9 @@ int nextui_app_is_connected(const NextuiApp* app)
     NextuiApp* mutable_app = (NextuiApp*)app;
 
     if (app == NULL) return 0;
-    pthread_mutex_lock(&mutable_app->lock);
+    pthread_mutex_lock(&mutable_app->state_lock);
     connected = app->connected;
-    pthread_mutex_unlock(&mutable_app->lock);
+    pthread_mutex_unlock(&mutable_app->state_lock);
     return connected;
 }
 
@@ -778,19 +991,38 @@ static NextuiAppStatus hello(NextuiApp* app, NextuiAppInfo* out)
     return NEXTUI_APP_OK;
 }
 
-static void apply_host_override(NextuiApp* app)
+static void apply_host_override(NextuiApp* app, int defer)
 {
-    NextuiAppInfo* info = &app->info;
+    NextuiAppInfo info;
+    int host;
 
-    if (app->host_override < 0) return;
-    if (!info->session_active || !info->overlay_host_declared) return;
-    if (info->overlay_host == app->host_override) return;
+    pthread_mutex_lock(&app->state_lock);
+    host = app->host_override;
+    pthread_mutex_unlock(&app->state_lock);
+    if (host < 0) return;
+
+    app_info_copy(app, &info);
+    if (!info.session_active || !info.overlay_host_declared) return;
+    if (info.overlay_host == host) return;
+
+    if (defer)
+    {
+        NxDeferred action;
+        memset(&action, 0, sizeof action);
+        action.kind = NX_DEFERRED_HOST_OVERRIDE;
+        action.host = host;
+        copy_string(action.session_id, sizeof action.session_id, info.session_id);
+        queue_deferred(app, &action);
+        return;
+    }
 
     {
-        NextuiAppStatus status = nextui_app_overlay_set_host(app, app->host_override);
+        NextuiAppStatus status = nextui_app_overlay_set_host(app, host);
         if (status == NEXTUI_APP_ERR_UNSUPPORTED || status == NEXTUI_APP_ERR_NOT_ADAPTED)
         {
+            pthread_mutex_lock(&app->state_lock);
             app->host_override = -1;
+            pthread_mutex_unlock(&app->state_lock);
             log_message(app, 1, "overlay.host is not available; static routing remains");
         }
     }
@@ -952,24 +1184,29 @@ NextuiAppStatus nextui_app_connect(NextuiApp* app, NextuiAppInfo* info)
 
     if (app == NULL) return NEXTUI_APP_ERR_INVALID_ARGUMENT;
     nextui_app_disconnect(app);
+    info_init(&fresh);
     app->stopped = 0;
     app->next_reconnect_at = 0;
+
+    pthread_mutex_lock(&app->event_lock);
     app->have_status = 0;
     app->queue_count = 0;
+    pthread_mutex_unlock(&app->event_lock);
+
+    pthread_mutex_lock(&app->state_lock);
     app->handshaking = 1;
+    pthread_mutex_unlock(&app->state_lock);
 
+    pthread_mutex_lock(&app->request_lock);
     status = hello(app, &fresh);
-    if (status != NEXTUI_APP_OK)
-    {
-        app->handshaking = 0;
-        if (status == NEXTUI_APP_ERR_UNSUPPORTED)
-            log_message(app, 1, "devserv does not implement the cooperation protocol");
-        return status;
-    }
+    if (status == NEXTUI_APP_OK) status = open_subscription(app, &fresh);
+    pthread_mutex_unlock(&app->request_lock);
 
-    status = open_subscription(app, &fresh);
+    pthread_mutex_lock(&app->state_lock);
     app->handshaking = 0;
-    if (status == NEXTUI_APP_ERR_UNSUPPORTED)
+    pthread_mutex_unlock(&app->state_lock);
+
+    if (status == NEXTUI_APP_ERR_UNSUPPORTED && fresh.features != 0)
     {
         /* The server has events but none of the families we asked for. */
         app->event_fd = -1;
@@ -977,20 +1214,24 @@ NextuiAppStatus nextui_app_connect(NextuiApp* app, NextuiAppInfo* info)
     }
     else if (status != NEXTUI_APP_OK)
     {
+        if (status == NEXTUI_APP_ERR_UNSUPPORTED)
+            log_message(app, 1, "devserv does not implement the cooperation protocol");
         return status;
     }
 
-    pthread_mutex_lock(&app->lock);
+    pthread_mutex_lock(&app->state_lock);
     app->info = fresh;
     app->connected = 1;
     app->heartbeat_ms = fresh.limits_heartbeat_ms;
     if (fresh.session_active && fresh.session_id[0] == '\0') app->info.session_active = 0;
-    pthread_mutex_unlock(&app->lock);
-
-    apply_host_override(app);
-    if (info != NULL) *info = app->info;
     app->last_error[0] = '\0';
     app->last_detail[0] = '\0';
+    pthread_mutex_unlock(&app->state_lock);
+
+    /* Connect is called before the poll loop starts, so the restore may run
+     * synchronously here. Reconnects defer it to the worker. */
+    apply_host_override(app, 0);
+    if (info != NULL) app_info_copy(app, info);
     return NEXTUI_APP_OK;
 }
 
@@ -1044,10 +1285,13 @@ static void handle_line(NextuiApp* app, char* line)
         app->have_ready = 1;
     }
 
-    if (session_id[0] != '\0' && app->info.session_active
-        && app->info.session_id[0] != '\0' && strcmp(session_id, app->info.session_id) != 0)
+    if (session_id[0] != '\0')
     {
-        return; /* an event from another generation */
+        NextuiAppInfo info;
+        app_info_copy(app, &info);
+        if (info.session_active && info.session_id[0] != '\0'
+            && strcmp(session_id, info.session_id) != 0)
+            return; /* an event from another generation */
     }
 
     if (strcmp(name, "heartbeat") == 0 || strcmp(name, "subscription.ready") == 0)
@@ -1057,14 +1301,25 @@ static void handle_line(NextuiApp* app, char* line)
 
     if (strcmp(name, "status.snapshot") == 0 || strcmp(name, "status.changed") == 0)
     {
-        NextuiStatus status = app->status;
+        NextuiStatus status;
+        int have_status;
         int clear = strcmp(name, "status.snapshot") == 0;
         unsigned present;
-        if (clear || !app->have_status) memset(&status, 0, sizeof status);
+
+        pthread_mutex_lock(&app->event_lock);
+        status = app->status;
+        have_status = app->have_status;
+        pthread_mutex_unlock(&app->event_lock);
+
+        if (clear || !have_status) memset(&status, 0, sizeof status);
         present = parse_status(line, &status, clear);
         (void)present;
+
+        pthread_mutex_lock(&app->event_lock);
         app->status = status;
         app->have_status = 1;
+        pthread_mutex_unlock(&app->event_lock);
+
         event.type = clear ? NEXTUI_APP_EVENT_STATUS_SNAPSHOT : NEXTUI_APP_EVENT_STATUS_CHANGED;
         event.data.status = status;
         (void)deliver(app, &event);
@@ -1111,64 +1366,58 @@ static void handle_line(NextuiApp* app, char* line)
         event.type = NEXTUI_APP_EVENT_SLEEP_PREPARE;
         event.data.sleep_prepare = prepare;
 
-        if (app->sleep_handler != NULL)
         {
-            NextuiAppSleepDecision decision;
-            memset(&decision, 0, sizeof decision);
-            app->sleep_handler(app, &prepare, &decision, app->sleep_user);
-            if (decision.action == NEXTUI_APP_SLEEP_PENDING) return;
-            if (decision.action == NEXTUI_APP_SLEEP_INHIBIT)
+            NextuiAppInfo info;
+            app_info_copy(app, &info);
+
+            if (app->sleep_handler != NULL)
             {
-                const char* reason = decision.reason != NULL && decision.reason[0] != '\0'
-                                         ? decision.reason
-                                         : "app";
-                int timeout = decision.timeout_ms > 0 ? decision.timeout_ms : 60000;
-                NextuiAppStatus status = nextui_app_sleep_inhibit_for(
-                    app, prepare.sleep_id, reason, timeout, decision.detail);
-                if (status != NEXTUI_APP_OK)
+                NextuiAppSleepDecision decision;
+                memset(&decision, 0, sizeof decision);
+                app->sleep_handler(app, &prepare, &decision, app->sleep_user);
+                if (decision.action == NEXTUI_APP_SLEEP_PENDING) return;
+
                 {
-                    NextuiAppEvent error = event;
-                    error.type = NEXTUI_APP_EVENT_TRANSPORT_ERROR;
-                    copy_string(error.data.error.code, sizeof error.data.error.code,
-                                nextui_app_last_error(app));
-                    copy_string(error.data.error.detail, sizeof error.data.error.detail,
-                                nextui_app_last_detail(app));
-                    (void)deliver(app, &error);
+                    NxDeferred action;
+                    memset(&action, 0, sizeof action);
+                    copy_string(action.session_id, sizeof action.session_id,
+                                info.session_active ? info.session_id : "");
+                    copy_string(action.sleep_id, sizeof action.sleep_id, prepare.sleep_id);
+                    if (decision.action == NEXTUI_APP_SLEEP_INHIBIT)
+                    {
+                        action.kind = NX_DEFERRED_SLEEP_INHIBIT;
+                        copy_string(action.reason, sizeof action.reason,
+                                    decision.reason != NULL && decision.reason[0] != '\0'
+                                        ? decision.reason
+                                        : "app");
+                        action.timeout_ms = decision.timeout_ms > 0 ? decision.timeout_ms : 60000;
+                    }
+                    else
+                    {
+                        action.kind = NX_DEFERRED_SLEEP_ACK;
+                        action.paused = decision.paused;
+                        action.saved = decision.saved;
+                    }
+                    copy_string(action.detail, sizeof action.detail, decision.detail);
+                    /* The worker sends the ack/inhibit; the pump must never
+                     * wait on request_lock while the subscribe socket has
+                     * readable data. */
+                    queue_deferred(app, &action);
                 }
+
+                /* The handler consumed the prepare; do not notify a second time. */
                 return;
             }
+
             {
-                NextuiAppStatus status = nextui_app_sleep_ack(
-                    app, prepare.sleep_id, decision.paused, decision.saved, decision.detail);
-                if (status != NEXTUI_APP_OK)
-                {
-                    NextuiAppEvent error = event;
-                    error.type = NEXTUI_APP_EVENT_TRANSPORT_ERROR;
-                    copy_string(error.data.error.code, sizeof error.data.error.code,
-                                nextui_app_last_error(app));
-                    copy_string(error.data.error.detail, sizeof error.data.error.detail,
-                                nextui_app_last_detail(app));
-                    (void)deliver(app, &error);
-                    return;
-                }
-            }
-            /* The handler consumed the prepare; do not notify a second time. */
-            return;
-        }
-        else
-        {
-            NextuiAppStatus status =
-                nextui_app_sleep_ack(app, prepare.sleep_id, 0, 0, "auto-ack");
-            if (status != NEXTUI_APP_OK)
-            {
-                NextuiAppEvent error = event;
-                error.type = NEXTUI_APP_EVENT_TRANSPORT_ERROR;
-                copy_string(error.data.error.code, sizeof error.data.error.code,
-                            nextui_app_last_error(app));
-                copy_string(error.data.error.detail, sizeof error.data.error.detail,
-                            nextui_app_last_detail(app));
-                (void)deliver(app, &error);
-                return;
+                NxDeferred action;
+                memset(&action, 0, sizeof action);
+                action.kind = NX_DEFERRED_SLEEP_ACK;
+                copy_string(action.session_id, sizeof action.session_id,
+                            info.session_active ? info.session_id : "");
+                copy_string(action.sleep_id, sizeof action.sleep_id, prepare.sleep_id);
+                copy_string(action.detail, sizeof action.detail, "auto-ack");
+                queue_deferred(app, &action);
             }
         }
         (void)deliver(app, &event);
@@ -1208,12 +1457,12 @@ static void handle_line(NextuiApp* app, char* line)
         copy_string(event.data.session_ended.reason, sizeof event.data.session_ended.reason,
                     reason);
         app->stopped = 1;
-        pthread_mutex_lock(&app->lock);
+        pthread_mutex_lock(&app->state_lock);
         app->info.session_active = 0;
         app->info.session_id[0] = '\0';
         app->info.overlay_host = 0;
         app->info.overlay_host_declared = 0;
-        pthread_mutex_unlock(&app->lock);
+        pthread_mutex_unlock(&app->state_lock);
         (void)deliver(app, &event);
         close_event_stream(app, 0, NULL);
         return;
@@ -1236,41 +1485,52 @@ static void handle_line(NextuiApp* app, char* line)
 static int reconnect_now(NextuiApp* app, int* produced)
 {
     NextuiAppInfo fresh;
+    NextuiAppInfo previous_info;
     NextuiAppStatus status;
+    char previous[NEXTUI_APP_SESSION_ID_SIZE];
+    int was_active;
 
+    info_init(&fresh);
+    app_info_copy(app, &previous_info);
+    copy_string(previous, sizeof previous, previous_info.session_id);
+    was_active = previous_info.session_active;
+
+    pthread_mutex_lock(&app->state_lock);
     app->handshaking = 1;
+    pthread_mutex_unlock(&app->state_lock);
+
+    pthread_mutex_lock(&app->request_lock);
     status = hello(app, &fresh);
+    if (status == NEXTUI_APP_OK) status = open_subscription(app, &fresh);
+    pthread_mutex_unlock(&app->request_lock);
+
+    pthread_mutex_lock(&app->state_lock);
+    app->handshaking = 0;
+    pthread_mutex_unlock(&app->state_lock);
+
     if (status == NEXTUI_APP_OK)
     {
-        char previous[NEXTUI_APP_SESSION_ID_SIZE];
-        int was_active;
-
-        pthread_mutex_lock(&app->lock);
-        copy_string(previous, sizeof previous, app->info.session_id);
-        was_active = app->info.session_active;
-        pthread_mutex_unlock(&app->lock);
-
-        status = open_subscription(app, &fresh);
-        app->handshaking = 0;
-
-        if (status == NEXTUI_APP_OK && app->event_fd < 0) status = NEXTUI_APP_ERR_UNSUPPORTED;
-        if (status == NEXTUI_APP_OK && app->event_fd >= 0)
+        if (app->event_fd < 0) status = NEXTUI_APP_ERR_UNSUPPORTED;
+        if (app->event_fd >= 0)
         {
             int changed = 0;
 
-            pthread_mutex_lock(&app->lock);
+            pthread_mutex_lock(&app->state_lock);
             if (was_active
                 && (!fresh.session_active || strcmp(previous, fresh.session_id) != 0))
                 changed = 1;
             app->info = fresh;
             app->heartbeat_ms = fresh.limits_heartbeat_ms;
-            pthread_mutex_unlock(&app->lock);
+            pthread_mutex_unlock(&app->state_lock);
 
             app->last_event_at = nx_now_ms();
             app->inlen = 0;
             app->last_seq = 0;
             app->next_reconnect_at = 0;
-            apply_host_override(app);
+            /* A reconnect is driven from the pump. Queue the host restore so
+             * the pump keeps draining this new subscription while devserv
+             * answers the request. */
+            apply_host_override(app, 1);
 
             if (changed)
             {
@@ -1288,10 +1548,6 @@ static int reconnect_now(NextuiApp* app, int* produced)
             return 1;
         }
     }
-    else
-    {
-        app->handshaking = 0;
-    }
 
     schedule_reconnect(app);
     if (status == NEXTUI_APP_ERR_UNSUPPORTED) return -1;
@@ -1303,15 +1559,23 @@ static int pump(NextuiApp* app, int timeout_ms)
     int produced = 0;
     unsigned long long start = nx_now_ms();
     int remaining = timeout_ms;
+    int connected;
+    unsigned features;
 
     if (app == NULL) return NEXTUI_APP_ERR_INVALID_ARGUMENT;
-    if (!app->connected) return NEXTUI_APP_ERR_NOT_CONNECTED;
-    if ((app->info.features & NEXTUI_APP_FEATURE_EVENTS) == 0)
+    pthread_mutex_lock(&app->state_lock);
+    connected = app->connected;
+    features = app->info.features;
+    pthread_mutex_unlock(&app->state_lock);
+    if (!connected) return NEXTUI_APP_ERR_NOT_CONNECTED;
+    if ((features & NEXTUI_APP_FEATURE_EVENTS) == 0)
         return NEXTUI_APP_ERR_UNSUPPORTED;
+
+    produced += drain_async_errors(app);
 
     if (app->event_fd < 0)
     {
-        if ((app->info.features
+        if ((features
              & (NEXTUI_APP_FEATURE_SLEEP | NEXTUI_APP_FEATURE_STATUS
                 | NEXTUI_APP_FEATURE_HUD | NEXTUI_APP_FEATURE_OVERLAY)) == 0)
             return NEXTUI_APP_ERR_UNSUPPORTED;
@@ -1357,6 +1621,11 @@ static int pump(NextuiApp* app, int timeout_ms)
             wait_ms = timeout_ms - (int)elapsed;
         }
 
+        /* Worker actions and their transport errors are delivered on the
+         * pump thread, so wake up periodically while they are outstanding. */
+        if (wait_ms > NX_DEFERRED_WAKE_MS && deferred_pending(app))
+            wait_ms = NX_DEFERRED_WAKE_MS;
+
         wait.fd = app->event_fd;
         wait.events = POLLIN;
         wait.revents = 0;
@@ -1368,7 +1637,13 @@ static int pump(NextuiApp* app, int timeout_ms)
             schedule_reconnect(app);
             return produced;
         }
-        if (ready == 0) return produced;
+        if (ready == 0)
+        {
+            produced += drain_async_errors(app);
+            if (timeout_ms == 0) return produced;
+            if (nx_now_ms() - start >= (unsigned long long)timeout_ms) return produced;
+            continue;
+        }
 
         if (wait.revents & (POLLERR | POLLHUP | POLLNVAL))
         {
@@ -1426,6 +1701,7 @@ static int pump(NextuiApp* app, int timeout_ms)
             }
         }
 
+        produced += drain_async_errors(app);
         if (app->event_fd < 0) return produced;
         if (app->heartbeat_ms > 0
             && nx_now_ms() - app->last_event_at > (unsigned long long)app->heartbeat_ms * 3)
@@ -1461,15 +1737,19 @@ NextuiAppStatus nextui_app_next_event(NextuiApp* app, NextuiAppEvent* out, int t
     for (;;)
     {
         int result;
+        int queued;
 
-        if (app->queue_count > 0)
+        pthread_mutex_lock(&app->event_lock);
+        queued = app->queue_count;
+        if (queued > 0)
         {
             *out = app->queue[0];
             memmove(&app->queue[0], &app->queue[1],
                     (size_t)(app->queue_count - 1) * sizeof app->queue[0]);
             app->queue_count--;
-            return NEXTUI_APP_OK;
         }
+        pthread_mutex_unlock(&app->event_lock);
+        if (queued > 0) return NEXTUI_APP_OK;
 
         {
             unsigned long long elapsed = nx_now_ms() - start;
@@ -1661,11 +1941,13 @@ NextuiAppStatus nextui_app_sleep_ack(NextuiApp* app, const char* sleep_id, int p
                                      const char* detail)
 {
     NxWriter writer;
+    NextuiAppInfo info;
     char request[NEXTUI_APP_LINE_MAX];
     char response[NEXTUI_APP_LINE_MAX];
 
     if (app == NULL || sleep_id == NULL || sleep_id[0] == '\0')
         return NEXTUI_APP_ERR_INVALID_ARGUMENT;
+    app_info_copy(app, &info);
 
     nx_writer_init(&writer, request, sizeof request);
     nx_writer_char(&writer, '{');
@@ -1674,11 +1956,11 @@ NextuiAppStatus nextui_app_sleep_ack(NextuiApp* app, const char* sleep_id, int p
         nx_writer_prefix(&writer, &first);
         nx_writer_key(&writer, "op");
         nx_writer_string(&writer, "sleep.ack");
-        if (app->info.session_active)
+        if (info.session_active)
         {
             nx_writer_prefix(&writer, &first);
             nx_writer_key(&writer, "session_id");
-            nx_writer_string(&writer, app->info.session_id);
+            nx_writer_string(&writer, info.session_id);
         }
         nx_writer_prefix(&writer, &first);
         nx_writer_key(&writer, "sleep_id");
@@ -1704,9 +1986,12 @@ NextuiAppStatus nextui_app_sleep_ack(NextuiApp* app, const char* sleep_id, int p
 
 NextuiAppStatus nextui_app_sleep_inhibit(NextuiApp* app, const char* reason, int timeout_ms)
 {
+    NextuiAppInfo info;
+
     if (app == NULL || reason == NULL || reason[0] == '\0')
         return NEXTUI_APP_ERR_INVALID_ARGUMENT;
-    if (!app->info.session_active) return NEXTUI_APP_ERR_NOT_ACTIVE;
+    app_info_copy(app, &info);
+    if (!info.session_active) return NEXTUI_APP_ERR_NOT_ACTIVE;
     return nextui_app_sleep_inhibit_for(app, NULL, reason, timeout_ms, NULL);
 }
 
@@ -1715,13 +2000,15 @@ NextuiAppStatus nextui_app_sleep_inhibit_for(NextuiApp* app, const char* sleep_i
                                              const char* detail)
 {
     NxWriter writer;
+    NextuiAppInfo info;
     char request[NEXTUI_APP_LINE_MAX];
     char response[NEXTUI_APP_LINE_MAX];
     NextuiAppStatus status;
 
     if (app == NULL || reason == NULL || reason[0] == '\0') return NEXTUI_APP_ERR_INVALID_ARGUMENT;
     if (timeout_ms < 1000) return NEXTUI_APP_ERR_INVALID_ARGUMENT;
-    if (!app->info.session_active) return NEXTUI_APP_ERR_NOT_ACTIVE;
+    app_info_copy(app, &info);
+    if (!info.session_active) return NEXTUI_APP_ERR_NOT_ACTIVE;
 
     nx_writer_init(&writer, request, sizeof request);
     nx_writer_char(&writer, '{');
@@ -1732,7 +2019,7 @@ NextuiAppStatus nextui_app_sleep_inhibit_for(NextuiApp* app, const char* sleep_i
         nx_writer_string(&writer, "sleep.inhibit");
         nx_writer_prefix(&writer, &first);
         nx_writer_key(&writer, "session_id");
-        nx_writer_string(&writer, app->info.session_id);
+        nx_writer_string(&writer, info.session_id);
         if (sleep_id != NULL && sleep_id[0] != '\0')
         {
             nx_writer_prefix(&writer, &first);
@@ -1767,12 +2054,14 @@ NextuiAppStatus nextui_app_sleep_release(NextuiApp* app)
 NextuiAppStatus nextui_app_sleep_release_for(NextuiApp* app, const char* sleep_id)
 {
     NxWriter writer;
+    NextuiAppInfo info;
     char request[NEXTUI_APP_LINE_MAX];
     char response[NEXTUI_APP_LINE_MAX];
     NextuiAppStatus status;
 
     if (app == NULL) return NEXTUI_APP_ERR_INVALID_ARGUMENT;
-    if (!app->info.session_active) return NEXTUI_APP_ERR_NOT_ACTIVE;
+    app_info_copy(app, &info);
+    if (!info.session_active) return NEXTUI_APP_ERR_NOT_ACTIVE;
 
     nx_writer_init(&writer, request, sizeof request);
     nx_writer_char(&writer, '{');
@@ -1783,7 +2072,7 @@ NextuiAppStatus nextui_app_sleep_release_for(NextuiApp* app, const char* sleep_i
         nx_writer_string(&writer, "sleep.release");
         nx_writer_prefix(&writer, &first);
         nx_writer_key(&writer, "session_id");
-        nx_writer_string(&writer, app->info.session_id);
+        nx_writer_string(&writer, info.session_id);
         if (sleep_id != NULL && sleep_id[0] != '\0')
         {
             nx_writer_prefix(&writer, &first);
@@ -1804,19 +2093,21 @@ NextuiAppStatus nextui_app_sleep_release_for(NextuiApp* app, const char* sleep_i
 
 NextuiAppStatus nextui_app_hud_get_policy(NextuiApp* app, unsigned* kinds_app)
 {
+    NextuiAppInfo info;
     char response[NEXTUI_APP_LINE_MAX];
     NextuiAppStatus status;
     unsigned bits = 0;
 
     if (app == NULL || kinds_app == NULL) return NEXTUI_APP_ERR_INVALID_ARGUMENT;
-    if (!app->info.session_active) return NEXTUI_APP_ERR_NOT_ACTIVE;
+    app_info_copy(app, &info);
+    if (!info.session_active) return NEXTUI_APP_ERR_NOT_ACTIVE;
 
     {
         NxWriter writer;
         char request[NEXTUI_APP_LINE_MAX];
         nx_writer_init(&writer, request, sizeof request);
         nx_writer_raw(&writer, "{\"op\":\"hud.policy\",\"session_id\":");
-        nx_writer_string(&writer, app->info.session_id);
+        nx_writer_string(&writer, info.session_id);
         nx_writer_char(&writer, '}');
         if (!nx_writer_finish(&writer)) return NEXTUI_APP_ERR_INVALID_ARGUMENT;
         status = nextui_app_request(app, request, response, sizeof response);
@@ -1870,6 +2161,7 @@ NextuiAppStatus nextui_app_hud_set_policy(NextuiApp* app, unsigned kinds, Nextui
         {NEXTUI_APP_HUD_MUTE, "mute"},
     };
     NxWriter writer;
+    NextuiAppInfo info;
     char request[NEXTUI_APP_LINE_MAX];
     char response[NEXTUI_APP_LINE_MAX];
     NextuiAppStatus status;
@@ -1878,7 +2170,8 @@ NextuiAppStatus nextui_app_hud_set_policy(NextuiApp* app, unsigned kinds, Nextui
     size_t i;
 
     if (app == NULL) return NEXTUI_APP_ERR_INVALID_ARGUMENT;
-    if (!app->info.session_active) return NEXTUI_APP_ERR_NOT_ACTIVE;
+    app_info_copy(app, &info);
+    if (!info.session_active) return NEXTUI_APP_ERR_NOT_ACTIVE;
     if (kinds == 0) kinds = NEXTUI_APP_HUD_ALL;
     if (kinds & ~(unsigned)NEXTUI_APP_HUD_ALL) return NEXTUI_APP_ERR_INVALID_ARGUMENT;
 
@@ -1889,7 +2182,7 @@ NextuiAppStatus nextui_app_hud_set_policy(NextuiApp* app, unsigned kinds, Nextui
     nx_writer_string(&writer, "hud.policy");
     nx_writer_prefix(&writer, &first);
     nx_writer_key(&writer, "session_id");
-    nx_writer_string(&writer, app->info.session_id);
+    nx_writer_string(&writer, info.session_id);
     nx_writer_prefix(&writer, &first);
     nx_writer_key(&writer, "mode");
     nx_writer_string(&writer, mode == NEXTUI_APP_HUD_APP ? "app" : "system");
@@ -1913,25 +2206,41 @@ NextuiAppStatus nextui_app_hud_set_policy(NextuiApp* app, unsigned kinds, Nextui
 
 int nextui_app_overlay_host(const NextuiApp* app)
 {
-    return app != NULL ? app->info.overlay_host : 0;
+    int value;
+    NextuiApp* mutable_app = (NextuiApp*)app;
+
+    if (app == NULL) return 0;
+    pthread_mutex_lock(&mutable_app->state_lock);
+    value = app->info.overlay_host;
+    pthread_mutex_unlock(&mutable_app->state_lock);
+    return value;
 }
 
 int nextui_app_overlay_host_declared(const NextuiApp* app)
 {
-    return app != NULL ? app->info.overlay_host_declared : 0;
+    int value;
+    NextuiApp* mutable_app = (NextuiApp*)app;
+
+    if (app == NULL) return 0;
+    pthread_mutex_lock(&mutable_app->state_lock);
+    value = app->info.overlay_host_declared;
+    pthread_mutex_unlock(&mutable_app->state_lock);
+    return value;
 }
 
 NextuiAppStatus nextui_app_overlay_set_host(NextuiApp* app, int host)
 {
     NxWriter writer;
+    NextuiAppInfo info;
     char request[NEXTUI_APP_LINE_MAX];
     char response[NEXTUI_APP_LINE_MAX];
     NextuiAppStatus status;
     int value = 0;
 
     if (app == NULL) return NEXTUI_APP_ERR_INVALID_ARGUMENT;
-    if (!app->info.session_active) return NEXTUI_APP_ERR_NOT_ACTIVE;
-    if (host && !app->info.overlay_host_declared) return NEXTUI_APP_ERR_NOT_ADAPTED;
+    app_info_copy(app, &info);
+    if (!info.session_active) return NEXTUI_APP_ERR_NOT_ACTIVE;
+    if (host && !info.overlay_host_declared) return NEXTUI_APP_ERR_NOT_ADAPTED;
 
     nx_writer_init(&writer, request, sizeof request);
     nx_writer_char(&writer, '{');
@@ -1942,7 +2251,7 @@ NextuiAppStatus nextui_app_overlay_set_host(NextuiApp* app, int host)
         nx_writer_string(&writer, "overlay.host");
         nx_writer_prefix(&writer, &first);
         nx_writer_key(&writer, "session_id");
-        nx_writer_string(&writer, app->info.session_id);
+        nx_writer_string(&writer, info.session_id);
         nx_writer_prefix(&writer, &first);
         nx_writer_key(&writer, "host");
         nx_writer_bool(&writer, host != 0);
@@ -1953,28 +2262,30 @@ NextuiAppStatus nextui_app_overlay_set_host(NextuiApp* app, int host)
     status = nextui_app_request(app, request, response, sizeof response);
     if (status != NEXTUI_APP_OK) return status;
 
-    pthread_mutex_lock(&app->lock);
+    pthread_mutex_lock(&app->state_lock);
     if (json_bool(response, "overlay_host", &value)) app->info.overlay_host = value;
     if (json_bool(response, "overlay_host_declared", &value))
         app->info.overlay_host_declared = value;
     (void)json_ull(response, "host_changed_at_ms", &app->info.overlay_host_changed_at_ms);
-    pthread_mutex_unlock(&app->lock);
     app->host_override = host ? 1 : 0;
+    pthread_mutex_unlock(&app->state_lock);
     return NEXTUI_APP_OK;
 }
 
 NextuiAppStatus nextui_app_overlay_set_open(NextuiApp* app, int open)
 {
     NxWriter writer;
+    NextuiAppInfo info;
     char request[NEXTUI_APP_LINE_MAX];
     char response[NEXTUI_APP_LINE_MAX];
     NextuiAppStatus status;
 
     if (app == NULL) return NEXTUI_APP_ERR_INVALID_ARGUMENT;
-    if (!app->info.session_active) return NEXTUI_APP_ERR_NOT_ACTIVE;
-    if (!app->info.overlay_host)
-        return app->info.overlay_host_declared ? NEXTUI_APP_ERR_NOT_HOSTING
-                                               : NEXTUI_APP_ERR_NOT_ADAPTED;
+    app_info_copy(app, &info);
+    if (!info.session_active) return NEXTUI_APP_ERR_NOT_ACTIVE;
+    if (!info.overlay_host)
+        return info.overlay_host_declared ? NEXTUI_APP_ERR_NOT_HOSTING
+                                          : NEXTUI_APP_ERR_NOT_ADAPTED;
 
     nx_writer_init(&writer, request, sizeof request);
     nx_writer_char(&writer, '{');
@@ -1985,7 +2296,7 @@ NextuiAppStatus nextui_app_overlay_set_open(NextuiApp* app, int open)
         nx_writer_string(&writer, "overlay.state");
         nx_writer_prefix(&writer, &first);
         nx_writer_key(&writer, "session_id");
-        nx_writer_string(&writer, app->info.session_id);
+        nx_writer_string(&writer, info.session_id);
         nx_writer_prefix(&writer, &first);
         nx_writer_key(&writer, "open");
         nx_writer_bool(&writer, open != 0);
@@ -2073,4 +2384,72 @@ NextuiAppStatus nextui_app_call(NextuiApp* app, const char* capability, const ch
 int nextui_app_json_escape(const char* input, char* out, size_t out_size)
 {
     return nx_json_escape(input, out, out_size);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Deferred request worker                                                   */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * The event pump never performs a synchronous request. sleep.prepare replies,
+ * sleep.inhibit and the post-reconnect overlay restore are queued here and
+ * executed on this thread, so a request that blocks on devserv (which may
+ * itself be blocked writing a full subscribe socket) cannot stop the pump from
+ * draining that socket.
+ */
+static void execute_deferred(NextuiApp* app, const NxDeferred* action)
+{
+    NextuiAppStatus status;
+
+    switch (action->kind)
+    {
+    case NX_DEFERRED_SLEEP_ACK:
+        status = nextui_app_sleep_ack(app, action->sleep_id, action->paused, action->saved,
+                                      action->detail);
+        if (status != NEXTUI_APP_OK) queue_async_error(app, action);
+        return;
+
+    case NX_DEFERRED_SLEEP_INHIBIT:
+        status = nextui_app_sleep_inhibit_for(app, action->sleep_id, action->reason,
+                                              action->timeout_ms, action->detail);
+        if (status != NEXTUI_APP_OK) queue_async_error(app, action);
+        return;
+
+    case NX_DEFERRED_HOST_OVERRIDE:
+        status = nextui_app_overlay_set_host(app, action->host);
+        if (status == NEXTUI_APP_ERR_UNSUPPORTED || status == NEXTUI_APP_ERR_NOT_ADAPTED)
+        {
+            pthread_mutex_lock(&app->state_lock);
+            app->host_override = -1;
+            pthread_mutex_unlock(&app->state_lock);
+            log_message(app, 1, "overlay.host is not available; static routing remains");
+        }
+        return;
+    }
+}
+
+static void* worker_main(void* argument)
+{
+    NextuiApp* app = (NextuiApp*)argument;
+
+    for (;;)
+    {
+        NxDeferred action;
+
+        pthread_mutex_lock(&app->deferred_lock);
+        while (app->deferred_count == 0 && !app->worker_stop)
+            pthread_cond_wait(&app->deferred_cond, &app->deferred_lock);
+        if (app->worker_stop)
+        {
+            pthread_mutex_unlock(&app->deferred_lock);
+            break;
+        }
+        action = app->deferred[app->deferred_head];
+        app->deferred_head = (app->deferred_head + 1) % NX_DEFERRED_CAPACITY;
+        app->deferred_count--;
+        pthread_mutex_unlock(&app->deferred_lock);
+
+        execute_deferred(app, &action);
+    }
+    return NULL;
 }

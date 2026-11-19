@@ -4,6 +4,7 @@
 #include "nextui_app.h"
 
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,12 +32,63 @@ static char fake_log[300];
         }                                                                                    \
     } while (0)
 
+static unsigned long long now_ms(void)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+    return (unsigned long long)now.tv_sec * 1000ULL + (unsigned long long)now.tv_nsec / 1000000ULL;
+}
+
 static void sleep_ms(int milliseconds)
 {
     struct timespec request;
     request.tv_sec = milliseconds / 1000;
     request.tv_nsec = (long)(milliseconds % 1000) * 1000000L;
     nanosleep(&request, NULL);
+}
+
+/*
+ * A deadlocked client must fail the test instead of hanging CI. This watchdog
+ * runs on its own thread; all client locks are process-local and do not stop
+ * it. It exits with 124 after 15 s.
+ */
+static volatile int watchdog_active;
+static int watchdog_started;
+static pthread_t watchdog_thread;
+
+static void* watchdog_main(void* argument)
+{
+    int index;
+
+    (void)argument;
+    for (index = 0; index < 150; index++)
+    {
+        sleep_ms(100);
+        if (!watchdog_active) return NULL;
+    }
+    fprintf(stderr, "FAIL: hang watchdog expired; the client deadlocked\n");
+    if (fake_pid > 0) kill(fake_pid, SIGKILL);
+    _exit(124);
+    return NULL;
+}
+
+static void watchdog_start(void)
+{
+    watchdog_active = 1;
+    if (pthread_create(&watchdog_thread, NULL, watchdog_main, NULL) == 0)
+        watchdog_started = 1;
+    else
+        fprintf(stderr, "warning: cannot start hang watchdog\n");
+}
+
+static void watchdog_stop(void)
+{
+    watchdog_active = 0;
+    if (watchdog_started)
+    {
+        pthread_join(watchdog_thread, NULL);
+        watchdog_started = 0;
+    }
 }
 
 static int connect_socket(const char* path)
@@ -162,6 +214,19 @@ static int log_contains(const char* needle)
     return found;
 }
 
+/* Sleep acks are sent by the library's deferred worker, so allow a moment. */
+static int wait_for_log(const char* needle, int timeout_ms)
+{
+    unsigned long long start = now_ms();
+
+    for (;;)
+    {
+        if (log_contains(needle)) return 1;
+        if (now_ms() - start >= (unsigned long long)timeout_ms) return 0;
+        sleep_ms(10);
+    }
+}
+
 static NextuiApp* app_connect(NextuiAppInfo* info)
 {
     NextuiAppConfig config;
@@ -201,6 +266,80 @@ static int next_of_type(NextuiApp* app, NextuiAppEventType type, int timeout_ms,
         if (out->type == type) return 1;
         timeout_ms = 100;
     }
+}
+
+typedef struct
+{
+    NextuiApp* app;
+    NextuiAppStatus status;
+    int elapsed_ms;
+    volatile int started;
+    volatile int done;
+} RequestResult;
+
+static void* battery_request_thread(void* argument)
+{
+    RequestResult* result = (RequestResult*)argument;
+    NextuiBattery battery;
+    unsigned long long start;
+
+    result->started = 1;
+    start = now_ms();
+    result->status = nextui_app_battery_get(result->app, &battery);
+    result->elapsed_ms = (int)(now_ms() - start);
+    result->done = 1;
+    return NULL;
+}
+
+static void wait_request_started(RequestResult* result)
+{
+    unsigned long long start = now_ms();
+
+    while (!result->started && now_ms() - start < 1000) sleep_ms(5);
+}
+
+static int start_battery_request(RequestResult* result, pthread_t* thread, NextuiApp* app)
+{
+    memset(result, 0, sizeof *result);
+    result->app = app;
+    if (pthread_create(thread, NULL, battery_request_thread, result) != 0) return 0;
+    wait_request_started(result);
+    return 1;
+}
+
+/* Callback-mode recorder: timestamps delivery on the pump thread. */
+#define SEEN_MAX 128
+
+typedef struct
+{
+    NextuiAppEvent event;
+    unsigned long long at_ms;
+} SeenEvent;
+
+static SeenEvent seen[SEEN_MAX];
+static int seen_count;
+
+static void record_event(NextuiApp* app, const NextuiAppEvent* event, void* user)
+{
+    (void)app;
+    (void)user;
+    if (seen_count >= SEEN_MAX) return;
+    seen[seen_count].event = *event;
+    seen[seen_count].at_ms = now_ms();
+    seen_count++;
+}
+
+static void seen_reset(void)
+{
+    seen_count = 0;
+}
+
+static SeenEvent* seen_first(NextuiAppEventType type)
+{
+    int index;
+    for (index = 0; index < seen_count; index++)
+        if (seen[index].event.type == type) return &seen[index];
+    return NULL;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -348,7 +487,7 @@ static void test_sleep_ack_and_wake(void)
     CHECK(nextui_app_wait(app, 1000) >= 0);
     CHECK(sleep_calls == 1);
     CHECK(strcmp(sleep_seen, "aaaabbbbccccdddd") == 0);
-    CHECK(log_contains("\"op\":\"sleep.ack\""));
+    CHECK(wait_for_log("\"op\":\"sleep.ack\"", 2000));
     CHECK(log_contains("\"sleep_id\":\"aaaabbbbccccdddd\""));
     CHECK(log_contains("\"paused\":true"));
 
@@ -386,7 +525,7 @@ static void test_sleep_inhibit(void)
                   response, sizeof response) == 1);
     CHECK(nextui_app_wait(app, 1000) >= 0);
     CHECK(sleep_calls == 1);
-    CHECK(log_contains("\"op\":\"sleep.inhibit\""));
+    CHECK(wait_for_log("\"op\":\"sleep.inhibit\"", 2000));
     CHECK(log_contains("\"reason\":\"playing_video\""));
     CHECK(log_contains("\"timeout_ms\":60000"));
 
@@ -675,8 +814,13 @@ static void test_reconnect(void)
     CHECK(next_of_type(app, NEXTUI_APP_EVENT_TRANSPORT_ERROR, 1000, &event) == 1);
     CHECK(next_of_type(app, NEXTUI_APP_EVENT_STATUS_SNAPSHOT, 4000, &event) == 1);
     CHECK(event.data.status.battery.percent == 87);
+    {
+        unsigned long long wait_start = now_ms();
+        while (nextui_app_overlay_host(app) != 0 && now_ms() - wait_start < 2000)
+            (void)nextui_app_wait(app, 50);
+    }
     CHECK(nextui_app_overlay_host(app) == 0);
-    CHECK(log_contains("\"host\":false"));
+    CHECK(wait_for_log("\"host\":false", 2000));
     nextui_app_destroy(app);
     fake_stop();
 }
@@ -841,6 +985,254 @@ static void test_sleep_status(void)
     fake_stop();
 }
 
+/* A request holds request_lock for its whole round trip. The pump must keep
+ * dispatching events (including sleep.prepare, which needs a request-channel
+ * reply) while that request is in flight. */
+static void test_request_in_flight_events(void)
+{
+    NextuiAppInfo info;
+    NextuiApp* app;
+    NextuiAppEvent event;
+    RequestResult request;
+    pthread_t thread;
+    char response[256];
+    unsigned long long start;
+
+    if (!fake_start("adapted")) return;
+    app = app_connect(&info);
+    if (app == NULL)
+    {
+        fake_stop();
+        return;
+    }
+    watchdog_start();
+    CHECK(next_of_type(app, NEXTUI_APP_EVENT_STATUS_SNAPSHOT, 1000, &event) == 1);
+    nextui_app_set_event_callback(app, record_event, NULL);
+    seen_reset();
+
+    CHECK(control("{\"op\":\"test.delay_requests\",\"ms\":600}", response, sizeof response) == 1);
+    if (!start_battery_request(&request, &thread, app))
+    {
+        CHECK(0 && "cannot start request thread");
+        nextui_app_destroy(app);
+        watchdog_stop();
+        fake_stop();
+        return;
+    }
+    sleep_ms(50);
+
+    CHECK(control("{\"op\":\"test.sleep_prepare\",\"sleep_id\":\"aaaabbbbccccdddd\","
+                  "\"reason\":\"user\",\"deadline_ms\":1500}",
+                  response, sizeof response) == 1);
+    CHECK(control("{\"op\":\"test.status\",\"percent\":42,\"level\":3}", response,
+                  sizeof response) == 1);
+
+    start = now_ms();
+    (void)nextui_app_wait(app, 300);
+    {
+        SeenEvent* prepare = seen_first(NEXTUI_APP_EVENT_SLEEP_PREPARE);
+        SeenEvent* changed = seen_first(NEXTUI_APP_EVENT_STATUS_CHANGED);
+        CHECK(prepare != NULL);
+        if (prepare != NULL)
+        {
+            CHECK(prepare->at_ms - start < 100);
+            CHECK(prepare->event.data.sleep_prepare.deadline_ms == 1500);
+        }
+        CHECK(changed != NULL);
+        if (changed != NULL)
+        {
+            CHECK(changed->at_ms - start < 100);
+            CHECK(changed->event.data.status.battery.percent == 42);
+        }
+    }
+
+    pthread_join(thread, NULL);
+    CHECK(request.status == NEXTUI_APP_OK);
+    CHECK(request.elapsed_ms >= 500);
+    CHECK(wait_for_log("\"op\":\"sleep.ack\"", 2000));
+
+    CHECK(control("{\"op\":\"test.delay_requests\",\"ms\":0}", response, sizeof response) == 1);
+    nextui_app_destroy(app);
+    watchdog_stop();
+    fake_stop();
+}
+
+static void test_session_ended_during_request(void)
+{
+    NextuiAppInfo info;
+    NextuiApp* app;
+    NextuiAppEvent event;
+    RequestResult request;
+    pthread_t thread;
+    char response[256];
+    unsigned long long start;
+
+    if (!fake_start("adapted")) return;
+    app = app_connect(&info);
+    if (app == NULL)
+    {
+        fake_stop();
+        return;
+    }
+    watchdog_start();
+    CHECK(next_of_type(app, NEXTUI_APP_EVENT_STATUS_SNAPSHOT, 1000, &event) == 1);
+    nextui_app_set_event_callback(app, record_event, NULL);
+    seen_reset();
+
+    CHECK(control("{\"op\":\"test.delay_requests\",\"ms\":600}", response, sizeof response) == 1);
+    if (!start_battery_request(&request, &thread, app))
+    {
+        CHECK(0 && "cannot start request thread");
+        nextui_app_destroy(app);
+        watchdog_stop();
+        fake_stop();
+        return;
+    }
+    sleep_ms(50);
+
+    CHECK(control("{\"op\":\"test.session_ended\",\"reason\":\"stopped\"}", response,
+                  sizeof response) == 1);
+
+    start = now_ms();
+    (void)nextui_app_wait(app, 300);
+    {
+        SeenEvent* ended = seen_first(NEXTUI_APP_EVENT_SESSION_ENDED);
+        CHECK(ended != NULL);
+        if (ended != NULL)
+        {
+            CHECK(ended->at_ms - start < 100);
+            CHECK(strcmp(ended->event.data.session_ended.reason, "stopped") == 0);
+        }
+    }
+    CHECK(nextui_app_info(app)->session_active == 0);
+
+    pthread_join(thread, NULL);
+    CHECK(request.status == NEXTUI_APP_OK);
+
+    CHECK(control("{\"op\":\"test.delay_requests\",\"ms\":0}", response, sizeof response) == 1);
+    nextui_app_destroy(app);
+    watchdog_stop();
+    fake_stop();
+}
+
+static void test_overflow_during_request(void)
+{
+    NextuiAppInfo info;
+    NextuiApp* app;
+    NextuiAppEvent event;
+    RequestResult request;
+    pthread_t thread;
+    char response[256];
+    unsigned long long start;
+
+    if (!fake_start("adapted")) return;
+    app = app_connect(&info);
+    if (app == NULL)
+    {
+        fake_stop();
+        return;
+    }
+    watchdog_start();
+    CHECK(next_of_type(app, NEXTUI_APP_EVENT_STATUS_SNAPSHOT, 1000, &event) == 1);
+    nextui_app_set_event_callback(app, record_event, NULL);
+    seen_reset();
+
+    CHECK(control("{\"op\":\"test.delay_requests\",\"ms\":600}", response, sizeof response) == 1);
+    if (!start_battery_request(&request, &thread, app))
+    {
+        CHECK(0 && "cannot start request thread");
+        nextui_app_destroy(app);
+        watchdog_stop();
+        fake_stop();
+        return;
+    }
+    sleep_ms(50);
+
+    CHECK(control("{\"op\":\"test.overflow\"}", response, sizeof response) == 1);
+
+    start = now_ms();
+    (void)nextui_app_wait(app, 300);
+    {
+        SeenEvent* overflow = seen_first(NEXTUI_APP_EVENT_OVERFLOW);
+        CHECK(overflow != NULL);
+        if (overflow != NULL)
+        {
+            CHECK(overflow->at_ms - start < 100);
+            CHECK(overflow->event.data.overflow.dropped == 3);
+        }
+    }
+
+    pthread_join(thread, NULL);
+    CHECK(request.status == NEXTUI_APP_OK);
+
+    CHECK(control("{\"op\":\"test.delay_requests\",\"ms\":0}", response, sizeof response) == 1);
+    nextui_app_destroy(app);
+    watchdog_stop();
+    fake_stop();
+}
+
+/*
+ * The deadlock regression: fill the subscribe socket while the client is not
+ * polling, then issue a request from another thread. The fake devserv's
+ * publish path holds its state lock across the blocking event write, so its
+ * request path cannot answer until the client drains. The client must drain
+ * even though a request is waiting, or the request times out (and with a
+ * less forgiving server, the whole app hangs).
+ */
+static void test_subscribe_buffer_full_request(void)
+{
+    NextuiAppInfo info;
+    NextuiApp* app;
+    NextuiAppEvent event;
+    RequestResult request;
+    pthread_t thread;
+    char response[256];
+    unsigned long long start;
+    SeenEvent* prepare;
+
+    if (!fake_start("adapted")) return;
+    app = app_connect(&info);
+    if (app == NULL)
+    {
+        fake_stop();
+        return;
+    }
+    watchdog_start();
+    CHECK(next_of_type(app, NEXTUI_APP_EVENT_STATUS_SNAPSHOT, 1000, &event) == 1);
+    nextui_app_set_event_callback(app, record_event, NULL);
+    seen_reset();
+
+    CHECK(control("{\"op\":\"test.flood\",\"events\":4000}", response, sizeof response) == 1);
+    sleep_ms(100);
+
+    if (!start_battery_request(&request, &thread, app))
+    {
+        CHECK(0 && "cannot start request thread");
+        nextui_app_destroy(app);
+        watchdog_stop();
+        fake_stop();
+        return;
+    }
+    sleep_ms(50);
+
+    start = now_ms();
+    while (!request.done && now_ms() - start < 8000)
+        (void)nextui_app_wait(app, 50);
+    pthread_join(thread, NULL);
+    (void)nextui_app_wait(app, 200);
+
+    CHECK(request.status == NEXTUI_APP_OK);
+    CHECK(request.elapsed_ms < 1900);
+
+    prepare = seen_first(NEXTUI_APP_EVENT_SLEEP_PREPARE);
+    CHECK(prepare != NULL);
+    CHECK(wait_for_log("\"op\":\"sleep.ack\"", 3000));
+
+    nextui_app_destroy(app);
+    watchdog_stop();
+    fake_stop();
+}
+
 int main(int argc, char** argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -885,6 +1277,14 @@ int main(int argc, char** argv)
     test_sleep_status_detail();
     printf("-- sleep status --\n");
     test_sleep_status();
+    printf("-- request in flight while events arrive --\n");
+    test_request_in_flight_events();
+    printf("-- session ended during a request --\n");
+    test_session_ended_during_request();
+    printf("-- overflow during a request --\n");
+    test_overflow_during_request();
+    printf("-- full subscribe buffer with a concurrent request --\n");
+    test_subscribe_buffer_full_request();
 
     if (failures != 0)
     {

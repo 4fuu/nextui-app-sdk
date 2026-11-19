@@ -5,6 +5,8 @@ CPPFLAGS ?= -Iinclude
 WARNINGS ?= -std=c99 -Wall -Wextra -Werror -pedantic -D_POSIX_C_SOURCE=200809L
 LDFLAGS ?=
 LDLIBS ?= -pthread
+ASAN_OPTIONS ?=
+UBSAN_OPTIONS ?=
 PREFIX ?= /usr/local
 
 BUILD := build
@@ -16,7 +18,7 @@ TEST_BIN := $(BUILD)/test_json $(BUILD)/test_client
 FAKE := $(BUILD)/fake_devserv
 EXAMPLE := $(BUILD)/nextui-overlay-demo
 
-.PHONY: all lib test example clean install
+.PHONY: all lib test test-asan example clean install
 
 all: lib
 
@@ -46,9 +48,21 @@ $(EXAMPLE): examples/overlay_demo.c $(LIB) | $(BUILD)
 example: $(EXAMPLE)
 
 test: $(LIB) $(BUILD)/test_json $(BUILD)/test_client $(FAKE)
+	ASAN_OPTIONS="$(ASAN_OPTIONS)" \
+	UBSAN_OPTIONS="$(UBSAN_OPTIONS)" \
 	NEXTUI_FAKE_DEVSERV="$(abspath $(FAKE))" \
 	NEXTUI_TEST_TMP="$(abspath $(BUILD))/tmp" \
 	tests/run_tests.sh "$(abspath $(BUILD)/test_json)" "$(abspath $(BUILD)/test_client)"
+
+# Host regression suite with AddressSanitizer and UndefinedBehaviorSanitizer.
+# The client tests also have an internal 15 s deadlock watchdog.
+test-asan:
+	$(MAKE) clean
+	$(MAKE) test \
+		CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" \
+		LDFLAGS="-fsanitize=address,undefined" \
+		ASAN_OPTIONS="detect_leaks=1:abort_on_error=1" \
+		UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1"
 
 install: $(LIB)
 	install -d "$(DESTDIR)$(PREFIX)/include" "$(DESTDIR)$(PREFIX)/lib"
