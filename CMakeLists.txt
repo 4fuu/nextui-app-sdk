@@ -50,6 +50,9 @@ if(NEXTUI_APP_BUILD_TESTS)
 
     add_test(NAME json COMMAND test_json)
     add_test(NAME client COMMAND test_client $<TARGET_FILE:fake_devserv>)
+    # The client binary has an internal deadlock watchdog; this is the outer
+    # guard so a regression fails CI instead of hanging the job.
+    set_tests_properties(client PROPERTIES TIMEOUT 120)
 endif()
 
 install(TARGETS nextui_app ARCHIVE DESTINATION lib)

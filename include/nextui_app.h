@@ -26,14 +26,33 @@
  *
  * Thread-safety:
  *   - Request functions (battery/status/sleep/hud/overlay) may be called from
- *     any thread; they are serialized internally by a mutex.
+ *     any thread; they are serialized internally by a request mutex that the
+ *     event pump never takes.
  *   - nextui_app_poll / nextui_app_wait / nextui_app_next_event must be called
  *     from exactly one thread at a time, and not concurrently with each other.
+ *     The poll thread may run concurrently with request calls on other
+ *     threads; a blocked request never stops the event stream from draining.
  *   - Callbacks (event and sleep) run on the thread that calls poll/wait/
  *     next_event. They may call request functions, but must not call
- *     poll/wait/next_event recursively.
- *   - nextui_app_destroy must not race with any other call; the caller owns
- *     shutdown ordering.
+ *     poll/wait/next_event recursively. A blocking request made from a
+ *     callback stalls event delivery for its duration; use another thread for
+ *     work that may take long.
+ *   - Replies the pump has to send (sleep.ack, sleep.inhibit and the overlay
+ *     host restore after a reconnect) are sent by an internal worker thread,
+ *     so they cannot block the pump. Their errors are delivered as
+ *     NEXTUI_APP_EVENT_TRANSPORT_ERROR on the poll thread.
+ *   - nextui_app_connect / nextui_app_disconnect must not race with a poll
+ *     thread. nextui_app_destroy must not race with any other call; the caller
+ *     owns shutdown ordering.
+ *
+ * Internal locking:
+ *   - a request lock serializes request-channel round trips (held across
+ *     socket I/O);
+ *   - a state lock guards the session info, last error and host override;
+ *   - an event-queue lock guards the event queue and cached status.
+ *   Ordering is request lock -> state lock; the event lock is independent and
+ *   the pump takes neither the request lock nor any lock across poll/recv or
+ *   callbacks.
  *
  * Event data lifetime:
  *   Event structs are owned by the caller (next_event copies into it) or are

@@ -13,8 +13,10 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,7 +29,7 @@
 #define MAX_CLIENTS 16
 #define CLIENT_BUFFER 32768
 #define LINE_BUFFER 16384
-
+#define PENDING_BUFFER 4096
 
 typedef struct
 {
@@ -36,12 +38,29 @@ typedef struct
     unsigned next_seq;
     char buffer[CLIENT_BUFFER];
     size_t length;
+    char pending[PENDING_BUFFER];
+    unsigned long long pending_at;
+    int has_pending;
 } Client;
 
 static Client clients[MAX_CLIENTS];
 static const char* scenario = "adapted";
 static FILE* log_file = NULL;
 static int running = 1;
+
+/*
+ * Models the devserv session/publish lock. A request handler needs it, and
+ * the event flood holds it while a blocking send waits for the client to
+ * drain the subscribe socket. This is the coupling that turned a lock held
+ * across request I/O into a client/server deadlock.
+ */
+static pthread_mutex_t state_lock = PTHREAD_MUTEX_INITIALIZER;
+static int request_delay_ms = 0;
+static volatile int flood_active = 0;
+static int flood_fd = -1;
+static unsigned flood_seq = 1;
+static int flood_events = 4000;
+
 static int adapted = 1;
 static int overlay_declared = 1;
 static int overlay_host = 1;
@@ -90,9 +109,11 @@ static int write_all(int fd, const char* data, size_t length)
     return 1;
 }
 
-static void send_line(int fd, const char* line)
+static int send_line(int fd, const char* line)
 {
-    if (!write_all(fd, line, strlen(line)) || !write_all(fd, "\n", 1)) return;
+    if (!write_all(fd, line, strlen(line))) return 0;
+    if (!write_all(fd, "\n", 1)) return 0;
+    return 1;
 }
 
 static void send_json(int fd, const char* format, ...)
@@ -102,7 +123,51 @@ static void send_json(int fd, const char* format, ...)
     va_start(args, format);
     vsnprintf(line, sizeof line, format, args);
     va_end(args);
-    send_line(fd, line);
+    (void)send_line(fd, line);
+}
+
+/*
+ * Fills the subscribe socket while the client is not polling. Each send holds
+ * state_lock, so once the kernel buffer is full the flood blocks there and a
+ * normal request handler cannot proceed until the client drains the stream.
+ */
+static void* flood_main(void* argument)
+{
+    int fd = (int)(intptr_t)argument;
+    unsigned seq = flood_seq;
+    int index;
+
+    for (index = 0; index < flood_events && running; index++)
+    {
+        char line[LINE_BUFFER];
+        int sent = 1;
+
+        pthread_mutex_lock(&state_lock);
+        if (index == 2)
+        {
+            snprintf(line, sizeof line,
+                     "{\"event\":\"sleep.prepare\",\"seq\":%u,\"at_ms\":%llu,"
+                     "\"session_id\":\"%s\",\"sleep_id\":\"aaaabbbbccccdddd\","
+                     "\"reason\":\"user\",\"deadline_ms\":1500,\"deadline_at_ms\":%llu,"
+                     "\"battery\":{\"available\":true,\"percent\":87,\"charging\":false,"
+                     "\"usb\":false}}",
+                     seq++, now_ms(), session_id, now_ms() + 1500);
+            sent = send_line(fd, line);
+        }
+        if (sent)
+        {
+            snprintf(line, sizeof line, "{\"event\":\"heartbeat\",\"seq\":%u,\"at_ms\":%llu}",
+                     seq++, now_ms());
+            sent = send_line(fd, line);
+        }
+        pthread_mutex_unlock(&state_lock);
+        if (!sent) break;
+    }
+
+    pthread_mutex_lock(&state_lock);
+    flood_active = 0;
+    pthread_mutex_unlock(&state_lock);
+    return NULL;
 }
 
 static int field_string(const char* line, const char* key, char* out, size_t out_size)
@@ -275,8 +340,12 @@ static void send_snapshot(Client* client)
 static void handle_subscribe(Client* client, const char* line)
 {
     char session[64] = "";
+    int sndbuf = 8192;
 
     (void)line;
+    /* Keep the kernel buffer small so a flood blocks quickly, like a devserv
+     * whose publish path is waiting on a subscriber that stopped draining. */
+    (void)setsockopt(client->fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof sndbuf);
     client->is_event = 1;
     client->next_seq = 0;
     if (session_active) snprintf(session, sizeof session, ",\"session_id\":\"%s\"", session_id);
@@ -410,6 +479,47 @@ static void handle_control(int fd, const char* line)
         send_json(fd, "{\"ok\":true}");
         return;
     }
+    if (is_op(line, "test.delay_requests"))
+    {
+        (void)field_int(line, "ms", &request_delay_ms);
+        send_json(fd, "{\"ok\":true}");
+        return;
+    }
+    if (is_op(line, "test.flood"))
+    {
+        pthread_t thread;
+        int index;
+        int events = flood_events;
+
+        (void)field_int(line, "events", &events);
+        if (flood_active)
+        {
+            send_json(fd, "{\"ok\":false,\"error\":\"busy\",\"detail\":\"flood already running\"}");
+            return;
+        }
+        for (index = 0; index < MAX_CLIENTS; index++)
+        {
+            if (clients[index].fd >= 0 && clients[index].is_event) break;
+        }
+        if (index >= MAX_CLIENTS)
+        {
+            send_json(fd, "{\"ok\":false,\"error\":\"bad_request\",\"detail\":\"no subscriber\"}");
+            return;
+        }
+        flood_events = events > 0 ? events : 4000;
+        flood_fd = clients[index].fd;
+        flood_seq = clients[index].next_seq;
+        flood_active = 1;
+        if (pthread_create(&thread, NULL, flood_main, (void*)(intptr_t)flood_fd) != 0)
+        {
+            flood_active = 0;
+            send_json(fd, "{\"ok\":false,\"error\":\"io\",\"detail\":\"cannot start flood\"}");
+            return;
+        }
+        pthread_detach(thread);
+        send_json(fd, "{\"ok\":true}");
+        return;
+    }
     send_json(fd, "{\"ok\":false,\"error\":\"bad_request\",\"detail\":\"unknown test op\"}");
 }
 
@@ -450,6 +560,15 @@ static void handle_request(Client* client, const char* line)
     {
         char battery[160];
         battery_json(battery, sizeof battery);
+        if (request_delay_ms > 0)
+        {
+            snprintf(client->pending, sizeof client->pending,
+                     "{\"ok\":true,\"service\":\"devserv\",\"at_ms\":%llu,\"battery\":%s}",
+                     now_ms(), battery);
+            client->pending_at = now_ms() + (unsigned long long)request_delay_ms;
+            client->has_pending = 1;
+            return;
+        }
         send_json(fd, "{\"ok\":true,\"service\":\"devserv\",\"at_ms\":%llu,\"battery\":%s}",
                   now_ms(), battery);
         return;
@@ -683,6 +802,9 @@ static void close_client(Client* client)
     client->fd = -1;
     client->is_event = 0;
     client->length = 0;
+    client->has_pending = 0;
+    client->pending_at = 0;
+    client->pending[0] = '\0';
 }
 
 static Client* add_client(int fd)
@@ -709,7 +831,7 @@ static void handle_read(Client* client)
 
     if (count == 0)
     {
-        close_client(client);
+        if (!client->has_pending) close_client(client);
         return;
     }
     if (count < 0)
@@ -749,8 +871,16 @@ static void handle_read(Client* client)
             return;
         }
 
-        handle_request(client, line);
-        if (!client->is_event)
+        {
+            int is_test = strncmp(line, "{\"op\":\"test.", 11) == 0;
+
+            /* Normal requests need the devserv state lock. The flood holds it
+             * across a blocking event write, which is the point of the test. */
+            if (!is_test) pthread_mutex_lock(&state_lock);
+            handle_request(client, line);
+            if (!is_test) pthread_mutex_unlock(&state_lock);
+        }
+        if (!client->is_event && !client->has_pending)
         {
             close_client(client);
             return;
@@ -854,7 +984,7 @@ int main(int argc, char** argv)
 
         for (index = 0; index < MAX_CLIENTS; index++)
         {
-            if (clients[index].fd < 0) continue;
+            if (clients[index].fd < 0 || clients[index].has_pending) continue;
             waits[count].fd = clients[index].fd;
             waits[count].events = POLLIN;
             waits[count].revents = 0;
@@ -862,29 +992,44 @@ int main(int argc, char** argv)
             count++;
         }
 
-        ready = poll(waits, (nfds_t)count, 500);
+        ready = poll(waits, (nfds_t)count, 20);
         if (ready < 0)
         {
             if (errno == EINTR) continue;
             break;
         }
-        if (ready == 0) continue;
 
-        if (waits[0].revents & POLLIN)
+        if (ready > 0)
         {
-            int connection = accept(listener, NULL, NULL);
-            if (connection >= 0)
+            if (waits[0].revents & POLLIN)
             {
-                (void)fcntl(connection, F_SETFD, FD_CLOEXEC);
-                (void)add_client(connection);
+                int connection = accept(listener, NULL, NULL);
+                if (connection >= 0)
+                {
+                    (void)fcntl(connection, F_SETFD, FD_CLOEXEC);
+                    (void)add_client(connection);
+                }
+            }
+            for (index = 1; index < count; index++)
+            {
+                if (waits[index].revents & (POLLIN | POLLHUP | POLLERR))
+                {
+                    Client* client = &clients[mapping[index]];
+                    if (client->fd >= 0) handle_read(client);
+                }
             }
         }
-        for (index = 1; index < count; index++)
+
         {
-            if (waits[index].revents & (POLLIN | POLLHUP | POLLERR))
+            unsigned long long now = now_ms();
+            for (index = 0; index < MAX_CLIENTS; index++)
             {
-                Client* client = &clients[mapping[index]];
-                if (client->fd >= 0) handle_read(client);
+                Client* client = &clients[index];
+                if (client->fd < 0 || !client->has_pending) continue;
+                if (now < client->pending_at) continue;
+                (void)send_line(client->fd, client->pending);
+                client->has_pending = 0;
+                if (!client->is_event) close_client(client);
             }
         }
     }
